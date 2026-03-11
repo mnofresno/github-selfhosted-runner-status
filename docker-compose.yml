@@ -1,6 +1,6 @@
 services:
   runner:
-    image: myoung34/github-runner:latest
+    image: ${RUNNER_IMAGE:-myoung34/github-runner:latest}
     restart: unless-stopped
     env_file:
       - .env
@@ -10,7 +10,7 @@ services:
       EPHEMERAL: 'false'
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /home/mariano-fresno/github-selfhosted/work:/tmp/github-runner-bpf-application
+      - runner-work:/tmp/github-runner
 
   runner-status:
     image: node:20-alpine
@@ -24,4 +24,7 @@ services:
       - "${STATUS_PORT}:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /home/mariano-fresno/github-selfhosted/status-app:/app:ro
+      - ./status-app:/app:ro
+
+volumes:
+  runner-work:

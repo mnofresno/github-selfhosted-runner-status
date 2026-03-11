@@ -2,7 +2,7 @@
 
 Minimal self-hosted GitHub Actions runner stack with:
 
-- `myoung34/github-runner` for the runner container
+- a Dockerized self-hosted runner container
 - a tiny Node status app that shows runner state and recent workflow runs
 - force-cancel support for the active workflow run
 - rerun controls for an entire run, only failed jobs, or a specific past job
@@ -14,6 +14,7 @@ Minimal self-hosted GitHub Actions runner stack with:
 - `status-app/server.js`: GitHub API polling and HTML rendering
 - `status/index.html`: static fallback page
 - `.env.example`: required environment variables without secrets
+- no server-specific nginx, hostnames, or private infrastructure config
 
 ## Environment
 
@@ -26,6 +27,7 @@ Copy `.env.example` to `.env` and fill:
 - `LABELS`
 - `STATUS_PORT`
 - `COMPOSE_PROJECT_NAME`
+- `RUNNER_IMAGE`
 
 ## Run
 
@@ -35,5 +37,9 @@ docker compose up -d
 
 ## Notes
 
+- `myoung34/github-runner` is a third-party image, not an official GitHub image.
+- GitHub's official runner software lives in `actions/runner`, but GitHub does not provide an official Docker image for this use case.
+- The compose file stays generic on purpose. It should not include your real domain, nginx vhost, server paths, or secrets.
+- If someone clones this repo, they can run the stack locally or behind their own reverse proxy. A server-specific nginx file from your machine would not be reusable for them and would leak infrastructure details.
 - GitHub Actions supports rerunning a full run, rerunning failed jobs, and rerunning a specific job.
 - GitHub Actions does not expose a clean official API to cancel only one job while keeping the rest of the run alive.
