@@ -4,6 +4,7 @@ Minimal self-hosted GitHub Actions runner stack with:
 
 - `myoung34/github-runner` for the runner container
 - a tiny Node status app that shows runner state and recent workflow runs
+- force-cancel support for the active workflow run
 - `docker-compose.yml` for deployment
 
 ## Files
@@ -12,7 +13,6 @@ Minimal self-hosted GitHub Actions runner stack with:
 - `status-app/server.js`: GitHub API polling and HTML rendering
 - `status/index.html`: static fallback page
 - `.env.example`: required environment variables without secrets
-- `ops/nginx/github-selfhosted.fresno.ar.conf`: nginx reverse-proxy example
 
 ## Environment
 
@@ -24,6 +24,7 @@ Copy `.env.example` to `.env` and fill:
 - `RUNNER_WORKDIR`
 - `LABELS`
 - `STATUS_PORT`
+- `COMPOSE_PROJECT_NAME`
 
 ## Run
 

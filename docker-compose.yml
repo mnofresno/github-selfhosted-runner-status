@@ -17,8 +17,11 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      COMPOSE_PROJECT_NAME: github-selfhosted
     command: ["node", "/app/server.js"]
     ports:
       - "${STATUS_PORT}:8080"
     volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
       - /home/mariano-fresno/github-selfhosted/status-app:/app:ro
