@@ -1,97 +1,104 @@
-# github-selfhosted
+# github-runner-fleet
 
-Minimal self-hosted GitHub Actions runner stack with:
+Small Docker-based fleet manager for GitHub Actions runners.
 
-- a baseline Dockerized self-hosted runner container
-- a Node status app that can launch and remove additional ephemeral runners
-- support for multiple runner targets across repos and organizations
-- status visibility for local managed containers and GitHub-registered runners
-- run controls for repo-scoped targets: force-cancel, rerun all, rerun failed, inspect jobs
+It keeps one baseline runner service in Compose and exposes a local UI that can:
+
+- launch extra ephemeral runners per target
+- show Docker-managed runner containers and GitHub-registered runners side by side
+- show run controls for repo-scoped targets
+- support both repo-scoped and org-scoped runner targets
 
 ## Files
 
-- `docker-compose.yml`: baseline runner plus the status app
-- `status-app/server.js`: GitHub API polling, Docker orchestration, and HTML rendering
+- `docker-compose.yml`: baseline runner plus the local fleet UI
+- `status-app/server.js`: GitHub API polling, Docker orchestration, HTML rendering
 - `status/index.html`: static fallback page
-- `.env.example`: sample environment variables
+- `.env.example`: sample environment
 
 ## Environment
 
-Use `RUNNER_TARGETS_JSON` to define the fleet the UI can launch.
-
-Example:
+Use `RUNNER_TARGETS_JSON` to define the fleet:
 
 ```json
 [
   {
-    "id": "bpf-application",
-    "name": "BPF Application",
-    "scope": "repo",
-    "owner": "bpf-project",
-    "repo": "bpf-application",
-    "labels": ["self-hosted", "linux", "x64", "bpf"]
-  },
-  {
-    "id": "gymnerd-bot",
-    "name": "GymNerd Bot",
-    "scope": "repo",
-    "owner": "gymnerd-ar",
-    "repo": "gymnerd-bot",
-    "labels": ["self-hosted", "linux", "x64", "gymnerd"]
-  },
-  {
-    "id": "bpf-org-shared",
+    "id": "bpf-org",
     "name": "BPF Shared Org Fleet",
     "scope": "org",
     "owner": "bpf-project",
     "runnerGroup": "Default",
-    "labels": ["self-hosted", "linux", "x64", "shared"]
+    "labels": ["self-hosted", "linux", "x64", "bpf-org", "shared"]
+  },
+  {
+    "id": "gymnerd-org",
+    "name": "GymNerd Org Fleet",
+    "scope": "org",
+    "owner": "gymnerd-ar",
+    "runnerGroup": "Default",
+    "labels": ["self-hosted", "linux", "x64", "gymnerd", "shared"]
+  },
+  {
+    "id": "ops-repo",
+    "name": "Ops Repo",
+    "scope": "repo",
+    "owner": "mnofresno",
+    "repo": "github-runner-fleet",
+    "labels": ["self-hosted", "linux", "x64", "ops"]
   }
 ]
 ```
 
-Supported target fields:
+Supported fields:
 
 - `id`: stable slug used by the API and UI
 - `name`: display name
 - `scope`: `repo` or `org`
-- `owner`: GitHub org or owner
+- `owner`: GitHub owner or organization
 - `repo`: required for `repo` scope
-- `labels`: optional labels appended to the runner registration
-- `runnerGroup`: optional GitHub runner group name
+- `labels`: extra runner labels
+- `runnerGroup`: optional GitHub runner group for org scope
 - `description`: optional UI text
 - `accessToken`: optional per-target token override
 - `runnerImage`: optional image override
 - `runnerWorkdir`: optional workdir override
 
-Global environment variables:
+Shared variables:
 
 - `RUNNER_TARGETS_JSON`
-- `ACCESS_TOKEN`: optional default token reused by targets that omit `accessToken`
-- `REPO_URL`: still used by the baseline compose runner if you keep that service enabled
-- `RUNNER_NAME`: still used by the baseline compose runner
+- `ACCESS_TOKEN`
 - `RUNNER_IMAGE`
 - `RUNNER_WORKDIR`
+- `STATUS_BIND`
+- `STATUS_INTERNAL_PORT`
 - `STATUS_PORT`
 - `COMPOSE_PROJECT_NAME`
 
-Legacy single-target variables such as `REPO_URL`, `ACCESS_TOKEN`, and `RUNNER_NAME` still work as a fallback and remain useful for the baseline compose runner. `RUNNER_TARGETS_JSON` is the preferred path for the UI-managed fleet.
+Legacy single-target variables such as `REPO_URL`, `RUNNER_NAME`, and `RUNNER_SCOPE` still work for the baseline compose runner.
 
-## Recommendation
+## Ports
 
-Default to repo-scoped runners when you need isolation across organizations or billing boundaries.
+The UI container should listen on an internal numeric port. The host bind is configured separately.
 
-Use org-scoped runners only when:
+- `STATUS_INTERNAL_PORT=8080`
+- `STATUS_BIND=127.0.0.1:3571`
+- `STATUS_PORT=8080`
 
-- the same trusted organization owns all target repos
-- you want one shared fleet and broader repository access is acceptable
-- you are comfortable managing runner groups at the org level
+That split avoids the common mistake of passing `127.0.0.1:3571` into the Node process as if it were a listen port.
 
-For your setup, the pragmatic default is:
+## Scope choice
 
-- `bpf-project/bpf-application`: repo-scoped
-- `gymnerd-ar/gymnerd-bot`: repo-scoped
-- optional shared org-scoped targets later, only if several repos inside the same org truly need the same fleet
+Use org-scoped runners when:
+
+- several repos in the same organization should share capacity
+- the token has org runner administration permissions
+- access through runner groups is acceptable
+
+Use repo-scoped runners when:
+
+- the fleet must stay isolated to one repository
+- billing or trust boundaries differ
+- you need run-level controls tied to exactly one repository
 
 ## Run
 
@@ -99,19 +106,16 @@ For your setup, the pragmatic default is:
 docker compose up -d
 ```
 
-The status app keeps the baseline runner service, but the UI can now launch extra ephemeral runners on demand. Those launched containers are labeled, visible in the UI, and removable without touching the baseline service.
-
 ## GitHub permissions
 
-The token used by each target needs enough permission to register runners at that scope:
+The token used by a target needs runner administration at the same scope:
 
-- repo-scoped: repository admin access for self-hosted runners
-- org-scoped: org-level runner administration permissions
+- repo-scoped: repository self-hosted runner admin access
+- org-scoped: organization self-hosted runner admin access
 
-If one token does not cover every organization, set `accessToken` per target.
+If one token does not cover every org, set `accessToken` per target.
 
 ## Notes
 
-- `myoung34/github-runner` is a third-party image, not an official GitHub image.
-- GitHub's official runner software lives in `actions/runner`, but GitHub does not provide an official Docker image for this use case.
-- Org-scoped targets do not expose a single cross-repo workflow run feed, so run-level controls stay repo-scoped.
+- `myoung34/github-runner` is a third-party image.
+- The UI keeps backward compatibility with legacy Docker labels from the old `github-selfhosted` naming so old managed containers can still be listed and removed after the rename.

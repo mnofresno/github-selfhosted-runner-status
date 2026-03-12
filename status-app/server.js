@@ -2,11 +2,16 @@ const http = require('http');
 const https = require('https');
 const { URL } = require('url');
 
-const DEFAULT_PORT = Number.parseInt(process.env.STATUS_PORT || '8080', 10);
+const DEFAULT_PORT = 8080;
 const DEFAULT_WORKDIR = '/tmp/github-runner';
-const MANAGED_LABEL = 'io.github-selfhosted.managed';
-const MANAGED_TARGET_LABEL = 'io.github-selfhosted.target-id';
-const MANAGED_RUNNER_LABEL = 'io.github-selfhosted.runner-name';
+const DEFAULT_COMPOSE_PROJECT_NAME = 'github-runner-fleet';
+const LEGACY_COMPOSE_PROJECT_NAME = 'github-selfhosted';
+const MANAGED_LABEL = 'io.github-runner-fleet.managed';
+const MANAGED_TARGET_LABEL = 'io.github-runner-fleet.target-id';
+const MANAGED_RUNNER_LABEL = 'io.github-runner-fleet.runner-name';
+const LEGACY_MANAGED_LABEL = 'io.github-selfhosted.managed';
+const LEGACY_MANAGED_TARGET_LABEL = 'io.github-selfhosted.target-id';
+const LEGACY_MANAGED_RUNNER_LABEL = 'io.github-selfhosted.runner-name';
 const STATIC_RUNNER_LABEL = 'com.docker.compose.service=runner';
 
 function collectJson(res, resolve, reject) {
@@ -102,6 +107,22 @@ function escapeHtml(value) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+function parseListenPort(value) {
+  const candidate = String(value || '').trim();
+  if (/^\d+$/.test(candidate)) {
+    return Number.parseInt(candidate, 10);
+  }
+  return DEFAULT_PORT;
+}
+
+function managedLabelValue(labels, currentKey, legacyKey) {
+  return labels?.[currentKey] || labels?.[legacyKey] || '';
+}
+
+function isManagedResource(labels) {
+  return labels?.[MANAGED_LABEL] === 'true' || labels?.[LEGACY_MANAGED_LABEL] === 'true';
 }
 
 function slugify(value) {
@@ -222,20 +243,15 @@ function getTargetMap(targets) {
   return new Map(targets.map((target) => [target.id, target]));
 }
 
-function getManagedContainerFilters(extraLabels = []) {
-  return encodeURIComponent(JSON.stringify({
-    label: [MANAGED_LABEL, ...extraLabels],
-  }));
-}
-
 async function listManagedRunnerContainers(targetId) {
-  const labels = targetId ? [`${MANAGED_TARGET_LABEL}=${targetId}`] : [];
-  const response = await docker(`/containers/json?all=1&filters=${getManagedContainerFilters(labels)}`);
+  const response = await docker('/containers/json?all=1');
   if (response.statusCode < 200 || response.statusCode >= 300) {
     throw new Error(`Docker API ${response.statusCode}`);
   }
 
-  return response.body.map((container) => ({
+  return response.body
+    .filter((container) => isManagedResource(container.Labels))
+    .map((container) => ({
     id: container.Id,
     shortId: container.Id.slice(0, 12),
     name: (container.Names?.[0] || '').replace(/^\//, ''),
@@ -243,23 +259,26 @@ async function listManagedRunnerContainers(targetId) {
     state: container.State,
     status: container.Status,
     created: container.Created,
-    targetId: container.Labels?.[MANAGED_TARGET_LABEL] || '',
-    runnerName: container.Labels?.[MANAGED_RUNNER_LABEL] || '',
-  }));
+    targetId: managedLabelValue(container.Labels, MANAGED_TARGET_LABEL, LEGACY_MANAGED_TARGET_LABEL),
+    runnerName: managedLabelValue(container.Labels, MANAGED_RUNNER_LABEL, LEGACY_MANAGED_RUNNER_LABEL),
+  }))
+    .filter((container) => !targetId || container.targetId === targetId);
 }
 
 async function getStaticRunnerContainer() {
-  const filters = encodeURIComponent(JSON.stringify({
-    label: [
-      `com.docker.compose.project=${process.env.COMPOSE_PROJECT_NAME || 'github-selfhosted'}`,
-      STATIC_RUNNER_LABEL,
-    ],
-  }));
-  const response = await docker(`/containers/json?all=1&filters=${filters}`);
+  const response = await docker('/containers/json?all=1');
   if (response.statusCode < 200 || response.statusCode >= 300) {
     throw new Error(`Docker API ${response.statusCode}`);
   }
-  return response.body[0] || null;
+  const acceptedProjects = new Set([
+    process.env.COMPOSE_PROJECT_NAME || DEFAULT_COMPOSE_PROJECT_NAME,
+    LEGACY_COMPOSE_PROJECT_NAME,
+  ]);
+
+  return response.body.find((container) => (
+    container.Labels?.['com.docker.compose.service'] === 'runner'
+    && acceptedProjects.has(container.Labels?.['com.docker.compose.project'])
+  )) || null;
 }
 
 function formatRunnerName(target) {
@@ -609,14 +628,25 @@ async function getStatus(targets) {
   };
 }
 
+function renderLabelList(labels) {
+  if (!labels.length) {
+    return '<span class="muted">none</span>';
+  }
+  return labels.map((label) => `<span class="pill">${escapeHtml(label)}</span>`).join('');
+}
+
+function renderTone(value, tone) {
+  return `<span class="tone tone-${tone}">${escapeHtml(value)}</span>`;
+}
+
 function renderManagedRunnerRows(target) {
   if (!target.localRunners.length) {
-    return '<tr><td colspan="6">No launched ephemeral runners for this target.</td></tr>';
+    return '<tr><td colspan="5">No app-launched containers for this target.</td></tr>';
   }
 
   return target.localRunners.map((runner) => {
     const removeButton = `<button class="danger" data-container-id="${escapeHtml(runner.id)}" data-action="remove-runner">Remove</button>`;
-    return `<tr><td><code>${escapeHtml(runner.runnerName || runner.name)}</code></td><td>${escapeHtml(runner.state)}</td><td>${escapeHtml(runner.status)}</td><td>${escapeHtml(runner.image)}</td><td>${escapeHtml(new Date(runner.created * 1000).toISOString())}</td><td>${removeButton}</td></tr>`;
+    return `<tr><td><code>${escapeHtml(runner.runnerName || runner.name)}</code></td><td>${escapeHtml(runner.state)}</td><td>${escapeHtml(runner.status)}</td><td>${escapeHtml(new Date(runner.created * 1000).toISOString())}</td><td>${removeButton}</td></tr>`;
   }).join('');
 }
 
@@ -626,13 +656,13 @@ function renderGithubRunnerRows(target) {
   }
 
   return target.githubRunners.map((runner) => (
-    `<tr><td><code>${escapeHtml(runner.name)}</code></td><td>${escapeHtml(runner.status)}</td><td>${runner.busy ? '<span class="warn">busy</span>' : '<span class="ok">idle</span>'}</td><td>${escapeHtml(runner.os || '-')}</td><td>${runner.labels.map((label) => `<span class="pill">${escapeHtml(label)}</span>`).join('')}</td></tr>`
+    `<tr><td><code>${escapeHtml(runner.name)}</code></td><td>${escapeHtml(runner.status)}</td><td>${runner.busy ? renderTone('busy', 'warn') : renderTone('idle', 'ok')}</td><td>${escapeHtml(runner.os || '-')}</td><td>${renderLabelList(runner.labels)}</td></tr>`
   )).join('');
 }
 
 function renderRunRows(target) {
   if (target.scope !== 'repo') {
-    return '<tr><td colspan="6">Org-scoped runners do not expose a unified workflow run feed. Use repo-scoped targets when you need run-level controls.</td></tr>';
+    return '<tr><td colspan="6">Run history is shown per repository. This target is org-scoped.</td></tr>';
   }
   if (!target.latestRuns.length) {
     return '<tr><td colspan="6">No recent runs.</td></tr>';
@@ -641,73 +671,109 @@ function renderRunRows(target) {
   return target.latestRuns.map((run) => {
     const actions = [];
     if (run.status !== 'completed') {
-      actions.push(`<button class="danger" data-target-id="${escapeHtml(target.id)}" data-run-id="${escapeHtml(run.id)}" data-action="force-cancel">Force cancel</button>`);
+      actions.push(`<button class="danger" data-target-id="${escapeHtml(target.id)}" data-run-id="${escapeHtml(run.id)}" data-action="force-cancel">Cancel</button>`);
     } else {
       actions.push(`<button data-target-id="${escapeHtml(target.id)}" data-run-id="${escapeHtml(run.id)}" data-action="show-jobs">Jobs</button>`);
-      actions.push(`<button data-target-id="${escapeHtml(target.id)}" data-run-id="${escapeHtml(run.id)}" data-action="rerun-run">Rerun all</button>`);
-      actions.push(`<button data-target-id="${escapeHtml(target.id)}" data-run-id="${escapeHtml(run.id)}" data-action="rerun-failed">Rerun failed</button>`);
+      actions.push(`<button data-target-id="${escapeHtml(target.id)}" data-run-id="${escapeHtml(run.id)}" data-action="rerun-run">Rerun</button>`);
+      actions.push(`<button data-target-id="${escapeHtml(target.id)}" data-run-id="${escapeHtml(run.id)}" data-action="rerun-failed">Retry failed</button>`);
     }
     return `<tr><td><a href="${escapeHtml(run.url)}" target="_blank" rel="noreferrer">${run.id}</a></td><td>${escapeHtml(run.event)}</td><td>${escapeHtml(run.status)}</td><td>${escapeHtml(run.conclusion || '-')}</td><td>${escapeHtml(run.created_at)}</td><td><div class="actions">${actions.join('')}</div></td></tr>`;
   }).join('');
 }
 
+function renderActiveJobsRows(target) {
+  if (!target.activeJobs.length) {
+    return '<tr><td colspan="4">No active jobs.</td></tr>';
+  }
+
+  return target.activeJobs.map((job) => (
+    `<tr><td>${escapeHtml(job.name)}</td><td>${escapeHtml(job.status)}</td><td>${escapeHtml(job.conclusion || '-')}</td><td>${escapeHtml(job.runner_name || '-')}</td></tr>`
+  )).join('');
+}
+
 function renderTargetCard(target) {
-  const scopedCopy = target.scope === 'repo'
-    ? `Repository target for ${escapeHtml(target.repository)}`
-    : `Organization target for ${escapeHtml(target.owner)}`;
+  const repositoryLabel = target.scope === 'repo' ? target.repository : target.owner;
+  const activeRunCopy = target.activeRun
+    ? `Active run ${escapeHtml(target.activeRun.id)}`
+    : 'No active run';
 
   return `
-    <section class="card">
-      <div class="stack">
+    <section class="card target-card">
+      <div class="section-head">
         <div>
           <h2>${escapeHtml(target.name)}</h2>
-          <p class="muted">${scopedCopy}</p>
+          <div class="target-path">${escapeHtml(repositoryLabel)}</div>
         </div>
-        <button data-target-id="${escapeHtml(target.id)}" data-action="launch-runner">Launch ephemeral runner</button>
+        <div class="toolbar">
+          <span class="scope-chip">${escapeHtml(target.scope)}</span>
+          <button data-target-id="${escapeHtml(target.id)}" data-action="launch-runner">Launch runner</button>
+        </div>
       </div>
-      ${target.description ? `<p>${escapeHtml(target.description)}</p>` : ''}
-      <p>Scope: <strong>${escapeHtml(target.scope)}</strong></p>
-      <p>Labels: ${target.labels.length ? target.labels.map((label) => `<span class="pill">${escapeHtml(label)}</span>`).join('') : '<span class="muted">none</span>'}</p>
-      <div class="panel-grid">
+      ${target.description ? `<p class="muted compact">${escapeHtml(target.description)}</p>` : ''}
+      <div class="summary-strip">
+        <div><span class="summary-label">Managed</span><strong>${target.localRunners.length}</strong></div>
+        <div><span class="summary-label">Registered</span><strong>${target.githubRunners.length}</strong></div>
+        <div><span class="summary-label">Busy</span><strong>${target.githubRunners.filter((runner) => runner.busy).length}</strong></div>
+        <div><span class="summary-label">Latest</span><strong>${activeRunCopy}</strong></div>
+      </div>
+      <div class="meta-grid">
         <div>
-          <h3>Managed Ephemeral Runners</h3>
+          <div class="meta-label">Labels</div>
+          <div>${renderLabelList(target.labels)}</div>
+        </div>
+        <div>
+          <div class="meta-label">Scope</div>
+          <div>${escapeHtml(target.scope)}</div>
+        </div>
+      </div>
+      <div class="panel-grid">
+        <section class="subcard">
+          <h3>Managed Containers</h3>
           <table>
-            <thead><tr><th>Runner</th><th>State</th><th>Status</th><th>Image</th><th>Created</th><th>Action</th></tr></thead>
+            <thead><tr><th>Runner</th><th>State</th><th>Status</th><th>Created</th><th>Action</th></tr></thead>
             <tbody>${renderManagedRunnerRows(target)}</tbody>
           </table>
-        </div>
-        <div>
-          <h3>GitHub Registered Runners</h3>
+        </section>
+        <section class="subcard">
+          <h3>Registered in GitHub</h3>
           <table>
             <thead><tr><th>Name</th><th>Status</th><th>Busy</th><th>OS</th><th>Labels</th></tr></thead>
             <tbody>${renderGithubRunnerRows(target)}</tbody>
           </table>
-        </div>
+        </section>
       </div>
       <div class="panel-grid">
-        <div>
-          <h3>Latest Runs</h3>
+        <section class="subcard">
+          <div class="section-head section-head-tight">
+            <h3>Run Feed</h3>
+            <span class="muted">${target.scope === 'repo' ? escapeHtml(target.repository) : 'repo controls unavailable'}</span>
+          </div>
           <table>
             <thead><tr><th>Run</th><th>Event</th><th>Status</th><th>Conclusion</th><th>Created</th><th>Action</th></tr></thead>
             <tbody>${renderRunRows(target)}</tbody>
           </table>
-        </div>
-        <div>
-          <h3>Active Jobs</h3>
+          <div id="jobs-panel-${escapeHtml(target.id)}" class="jobs-panel muted">No completed run selected.</div>
+        </section>
+        <section class="subcard">
+          <div class="section-head section-head-tight">
+            <h3>Active Jobs</h3>
+            <span class="muted">${target.activeRun ? `run ${escapeHtml(target.activeRun.id)}` : 'idle'}</span>
+          </div>
           <table>
             <thead><tr><th>Job</th><th>Status</th><th>Conclusion</th><th>Runner</th></tr></thead>
-            <tbody>${target.activeJobs.length
-              ? target.activeJobs.map((job) => `<tr><td>${escapeHtml(job.name)}</td><td>${escapeHtml(job.status)}</td><td>${escapeHtml(job.conclusion || '-')}</td><td>${escapeHtml(job.runner_name || '-')}</td></tr>`).join('')
-              : '<tr><td colspan="4">No active jobs</td></tr>'}</tbody>
+            <tbody>${renderActiveJobsRows(target)}</tbody>
           </table>
-          <div id="jobs-panel-${escapeHtml(target.id)}" class="muted" style="margin-top: 12px;">No completed run selected.</div>
-        </div>
+        </section>
       </div>
     </section>
   `;
 }
 
 function render(status) {
+  const managedCount = status.managedRunners.length;
+  const registeredCount = status.targets.reduce((total, target) => total + target.githubRunners.length, 0);
+  const activeRuns = status.targets.filter((target) => target.activeRun).length;
+
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -716,51 +782,94 @@ function render(status) {
   <meta http-equiv="refresh" content="20">
   <title>GitHub Runner Fleet</title>
   <style>
-    :root { color-scheme: dark; }
-    body { margin: 0; font-family: ui-sans-serif, system-ui, sans-serif; background: #0f1115; color: #f4f6f8; }
-    main { max-width: 1280px; margin: 0 auto; padding: 24px; display: grid; gap: 16px; }
-    .card { background: #171a21; border: 1px solid #2a3140; border-radius: 14px; padding: 18px; box-shadow: 0 12px 36px rgba(0, 0, 0, 0.22); }
-    .stack { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
-    .panel-grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); margin-top: 16px; }
-    .muted { color: #9ca3af; }
-    .ok { color: #86efac; }
-    .warn { color: #fbbf24; }
-    .pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; margin: 0 6px 6px 0; border-radius: 999px; background: #1f2530; border: 1px solid #313a49; font-size: 12px; }
+    :root {
+      color-scheme: light;
+      --bg: #f3f4ef;
+      --surface: #ffffff;
+      --surface-muted: #f7f7f3;
+      --border: #d8d5cb;
+      --text: #1f2320;
+      --muted: #646a64;
+      --accent: #285540;
+      --accent-soft: #e6efe9;
+      --warn: #9a6b16;
+      --warn-soft: #fff2cf;
+      --danger: #9c3d2d;
+      --danger-soft: #fde7e3;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: "SF Pro Text", "Segoe UI Variable", "Helvetica Neue", sans-serif; background: var(--bg); color: var(--text); }
+    main { max-width: 1400px; margin: 0 auto; padding: 28px; display: grid; gap: 18px; }
+    .card, .subcard { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
+    .card { padding: 20px; }
+    .subcard { padding: 16px; }
+    .overview { display: grid; gap: 14px; grid-template-columns: minmax(0, 1.6fr) repeat(3, minmax(140px, 1fr)); align-items: stretch; }
+    .metric { padding: 16px; background: var(--surface-muted); border: 1px solid var(--border); border-radius: 10px; }
+    .metric strong { display: block; font-size: 28px; margin-top: 6px; }
+    .metric span { color: var(--muted); font-size: 13px; }
+    .page-head h1, .target-card h2, h3 { margin: 0; font-size: 22px; line-height: 1.15; }
+    h3 { font-size: 16px; }
+    .page-head p, .compact { margin: 8px 0 0; }
+    .muted { color: var(--muted); }
+    .section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+    .section-head-tight { align-items: center; margin-bottom: 12px; }
+    .toolbar, .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .target-path { margin-top: 6px; color: var(--muted); font-size: 14px; }
+    .summary-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 14px 0; }
+    .summary-strip > div { padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-muted); }
+    .summary-label, .meta-label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+    .summary-strip strong { font-size: 15px; }
+    .meta-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(120px, 1fr); gap: 12px; margin-bottom: 16px; }
+    .panel-grid { display: grid; gap: 14px; grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 14px; }
+    .pill, .scope-chip, .tone { display: inline-flex; align-items: center; padding: 4px 8px; border-radius: 8px; font-size: 12px; border: 1px solid var(--border); background: var(--surface-muted); margin: 0 6px 6px 0; }
+    .scope-chip { margin: 0; text-transform: lowercase; }
+    .tone-ok { color: var(--accent); background: var(--accent-soft); border-color: #c8dccf; }
+    .tone-warn { color: var(--warn); background: var(--warn-soft); border-color: #ecdba0; }
+    .tone-danger { color: var(--danger); background: var(--danger-soft); border-color: #efc4bc; }
     table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #2a3140; font-size: 14px; vertical-align: top; }
-    code { background: #11161d; border: 1px solid #2a3140; border-radius: 6px; padding: 2px 6px; }
-    button { border: 1px solid #42506a; background: #202938; color: #f9fafb; border-radius: 10px; padding: 9px 13px; font: inherit; cursor: pointer; }
-    button:hover { background: #273244; }
+    th, td { text-align: left; padding: 9px 0; border-bottom: 1px solid #ebe8de; font-size: 13px; vertical-align: top; }
+    th { color: var(--muted); font-weight: 600; }
+    td { padding-right: 12px; }
+    tr:last-child td { border-bottom: 0; }
+    code { font-family: "SFMono-Regular", "Consolas", monospace; background: var(--surface-muted); border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; }
+    button { border: 1px solid #bfc3b6; background: #f5f5f1; color: var(--text); border-radius: 8px; padding: 8px 12px; font: inherit; cursor: pointer; }
+    button:hover { background: #efefe9; }
     button:disabled { opacity: 0.6; cursor: wait; }
-    button.danger { border-color: #7f1d1d; background: #3f1619; color: #fecaca; }
-    a { color: #d7e3ff; text-decoration: none; }
-    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
-    #action-status { min-height: 22px; }
+    button.danger { border-color: #d9b1a8; background: var(--danger-soft); color: var(--danger); }
+    a { color: var(--accent); text-decoration: none; }
+    .jobs-panel { margin-top: 14px; padding: 12px; border: 1px dashed var(--border); border-radius: 8px; background: var(--surface-muted); min-height: 48px; }
+    #action-status { min-height: 20px; }
+    @media (max-width: 1024px) {
+      .overview, .summary-strip, .panel-grid, .meta-grid { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
   <main>
-    <section class="card">
-      <div class="stack">
-        <div>
-          <h1>GitHub Self-Hosted Runner Fleet</h1>
-          <p class="muted">Generated at <code>${escapeHtml(status.generatedAt)}</code></p>
-        </div>
-        <div class="muted">Recommendation: use repo-scoped targets by default. Reserve org-scoped runners for shared trusted repos inside the same organization.</div>
-      </div>
-      <p id="action-status" class="muted">The UI can launch multiple ephemeral runners. Each launched runner is isolated by target and removed independently.</p>
+    <section class="overview">
+      <section class="card page-head">
+        <h1>GitHub Runner Fleet</h1>
+        <p class="muted">Ephemeral runners by target, with GitHub registration state and repo-level run controls where that scope exists.</p>
+        <p class="muted">Updated <code>${escapeHtml(status.generatedAt)}</code></p>
+        <p id="action-status" class="muted">Launch creates a fresh runner container for one target. Remove deletes that container and its work volume.</p>
+      </section>
+      <section class="metric"><span>Targets</span><strong>${status.targets.length}</strong></section>
+      <section class="metric"><span>Managed containers</span><strong>${managedCount}</strong></section>
+      <section class="metric"><span>Registered runners</span><strong>${registeredCount}</strong></section>
     </section>
-    ${status.targets.map((target) => renderTargetCard(target)).join('')}
     <section class="card">
-      <h2>Fleet Summary</h2>
-      <p class="muted">All app-managed runner containers currently visible via Docker.</p>
+      <div class="section-head section-head-tight">
+        <h2>Fleet state</h2>
+        <span class="muted">${activeRuns} target(s) with an active run</span>
+      </div>
       <table>
         <thead><tr><th>Container</th><th>Target</th><th>Runner</th><th>State</th><th>Status</th></tr></thead>
         <tbody>${status.managedRunners.length
-          ? status.managedRunners.map((runner) => `<tr><td><code>${escapeHtml(runner.name)}</code></td><td>${escapeHtml(runner.targetId)}</td><td>${escapeHtml(runner.runnerName)}</td><td>${escapeHtml(runner.state)}</td><td>${escapeHtml(runner.status)}</td></tr>`).join('')
+          ? status.managedRunners.map((runner) => `<tr><td><code>${escapeHtml(runner.name)}</code></td><td>${escapeHtml(runner.targetId)}</td><td>${escapeHtml(runner.runnerName || '-')}</td><td>${escapeHtml(runner.state)}</td><td>${escapeHtml(runner.status)}</td></tr>`).join('')
           : '<tr><td colspan="5">No managed runners currently exist.</td></tr>'}</tbody>
       </table>
     </section>
+    ${status.targets.map((target) => renderTargetCard(target)).join('')}
   </main>
   <script>
     const statusNode = document.getElementById('action-status');
@@ -1049,7 +1158,7 @@ function createServer(targets = loadTargets()) {
 
 if (require.main === module) {
   const server = createServer();
-  server.listen(DEFAULT_PORT, '0.0.0.0');
+  server.listen(parseListenPort(process.env.STATUS_PORT), '0.0.0.0');
 }
 
 module.exports = {
@@ -1057,6 +1166,7 @@ module.exports = {
   createServer,
   loadTargets,
   normalizeTarget,
+  parseListenPort,
   parseRepoUrl,
   parseTargetsJson,
   slugify,
