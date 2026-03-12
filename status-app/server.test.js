@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const {
   buildRunnerContainerSpec,
   loadTargets,
+  parseListenPort,
   parseRepoUrl,
 } = require('./server');
 
@@ -65,4 +66,10 @@ test('buildRunnerContainerSpec creates isolated ephemeral runner payload', () =>
   assert.ok(spec.body.Env.includes('REPO_URL=https://github.com/gymnerd-ar/gymnerd-bot'));
   assert.ok(spec.body.HostConfig.Binds.includes('/var/run/docker.sock:/var/run/docker.sock'));
   assert.ok(spec.body.HostConfig.Binds.some((entry) => entry.endsWith(':/tmp/github-runner')));
+});
+
+test('parseListenPort ignores host bind strings and keeps internal default', () => {
+  assert.equal(parseListenPort('3571'), 3571);
+  assert.equal(parseListenPort('127.0.0.1:3571'), 8080);
+  assert.equal(parseListenPort(''), 8080);
 });

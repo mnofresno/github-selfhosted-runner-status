@@ -1,5 +1,5 @@
 {
-  "name": "github-selfhosted-runner-status",
+  "name": "github-runner-fleet",
   "private": true,
   "scripts": {
     "test": "node --test"

@@ -5,9 +5,9 @@ services:
     env_file:
       - .env
     environment:
-      RUNNER_SCOPE: repo
+      RUNNER_SCOPE: ${RUNNER_SCOPE:-repo}
       DISABLE_AUTO_UPDATE: 'true'
-      EPHEMERAL: 'true'
+      EPHEMERAL: ${EPHEMERAL:-true}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - runner-work:/tmp/github-runner
@@ -18,13 +18,14 @@ services:
     env_file:
       - .env
     environment:
-      COMPOSE_PROJECT_NAME: github-selfhosted
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-github-runner-fleet}
+      STATUS_PORT: ${STATUS_INTERNAL_PORT:-8080}
       CLEANUP_COOLDOWN_MS: ${CLEANUP_COOLDOWN_MS:-900000}
       CLEANUP_DANGLING_MAX_AGE: ${CLEANUP_DANGLING_MAX_AGE:-24h}
       CLEANUP_BUILD_CACHE_MAX_AGE: ${CLEANUP_BUILD_CACHE_MAX_AGE:-24h}
     command: ["node", "/app/server.js"]
     ports:
-      - "${STATUS_PORT}:8080"
+      - "${STATUS_BIND:-127.0.0.1:3571}:${STATUS_INTERNAL_PORT:-8080}"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./status-app:/app:ro
