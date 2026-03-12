@@ -1,0 +1,7 @@
+{
+  "name": "github-selfhosted-runner-status",
+  "private": true,
+  "scripts": {
+    "test": "node --test"
+  }
+}

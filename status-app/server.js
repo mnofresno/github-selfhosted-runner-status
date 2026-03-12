@@ -1,6 +1,7 @@
 const http = require('http');
 const https = require('https');
 const { URL } = require('url');
+const { shouldRunCleanup, pruneDanglingResources } = require('./cleanup');
 
 const repoUrl = process.env.REPO_URL || '';
 const token = process.env.ACCESS_TOKEN || '';
@@ -9,6 +10,11 @@ const composeProjectName = process.env.COMPOSE_PROJECT_NAME || 'github-selfhoste
 const match = repoUrl.match(/github\.com\/([^/]+)\/([^/]+)/i);
 const owner = match?.[1] || '';
 const repo = (match?.[2] || '').replace(/\.git$/i, '');
+const cleanupState = {
+  running: false,
+  lastRunAt: 0,
+  lastResult: null,
+};
 
 function collectJson(res, resolve, reject) {
   let data = '';
@@ -125,8 +131,38 @@ async function getStatus() {
     activeRun,
     activeJobs,
     latestRuns,
+    cleanup: cleanupState.lastResult,
     generatedAt: new Date().toISOString(),
   };
+}
+
+async function reconcileDanglingResources(status) {
+  const decision = shouldRunCleanup({ status, cleanupState });
+  if (!decision.ok) {
+    return;
+  }
+
+  cleanupState.running = true;
+  try {
+    const result = await pruneDanglingResources(docker);
+    cleanupState.lastRunAt = Date.now();
+    cleanupState.lastResult = {
+      status: 'completed',
+      reason: decision.reason,
+      completedAt: new Date(cleanupState.lastRunAt).toISOString(),
+      result,
+    };
+  } catch (error) {
+    cleanupState.lastRunAt = Date.now();
+    cleanupState.lastResult = {
+      status: 'failed',
+      reason: decision.reason,
+      completedAt: new Date(cleanupState.lastRunAt).toISOString(),
+      error: error.message,
+    };
+  } finally {
+    cleanupState.running = false;
+  }
 }
 
 async function getRunnerContainer() {
@@ -231,6 +267,7 @@ async function forceCancelRun(runId) {
 function render(status) {
   const runner = status.runner;
   const activeRun = status.activeRun;
+  const cleanup = status.cleanup;
   const jobs = status.activeJobs.length
     ? status.activeJobs.map((job) => `<tr><td>${escapeHtml(job.name)}</td><td>${escapeHtml(job.status)}</td><td>${escapeHtml(job.conclusion || '-')}</td><td>${escapeHtml(job.runner_name || '-')}</td></tr>`).join('')
     : '<tr><td colspan="4">No active jobs</td></tr>';
@@ -292,6 +329,7 @@ function render(status) {
         <p>Status: <strong class="${runner.busy ? 'warn' : 'ok'}">${escapeHtml(runner.status)}</strong> | Busy: <strong class="${runner.busy ? 'warn' : 'ok'}">${runner.busy}</strong></p>
         <div>${runner.labels.map((label) => `<span class="pill">${escapeHtml(label)}</span>`).join('')}</div>
       ` : '<p class="bad">Runner not found in GitHub API.</p>'}
+      ${cleanup ? `<p>Cleanup: <strong>${escapeHtml(cleanup.status)}</strong> at <code>${escapeHtml(cleanup.completedAt || '-')}</code></p>` : '<p>Cleanup: <strong>pending</strong></p>'}
     </div>
     <div class="card">
       <h2>Active Jobs</h2>
@@ -486,6 +524,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     const status = await getStatus();
+    void reconcileDanglingResources(status);
     if (requestUrl.pathname === '/api/status') {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify(status));

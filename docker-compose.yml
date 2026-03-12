@@ -7,7 +7,7 @@ services:
     environment:
       RUNNER_SCOPE: repo
       DISABLE_AUTO_UPDATE: 'true'
-      EPHEMERAL: 'false'
+      EPHEMERAL: 'true'
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - runner-work:/tmp/github-runner
@@ -19,6 +19,9 @@ services:
       - .env
     environment:
       COMPOSE_PROJECT_NAME: github-selfhosted
+      CLEANUP_COOLDOWN_MS: ${CLEANUP_COOLDOWN_MS:-900000}
+      CLEANUP_DANGLING_MAX_AGE: ${CLEANUP_DANGLING_MAX_AGE:-24h}
+      CLEANUP_BUILD_CACHE_MAX_AGE: ${CLEANUP_BUILD_CACHE_MAX_AGE:-24h}
     command: ["node", "/app/server.js"]
     ports:
       - "${STATUS_PORT}:8080"
