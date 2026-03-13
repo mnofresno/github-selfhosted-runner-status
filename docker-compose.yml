@@ -10,7 +10,7 @@ services:
       EPHEMERAL: ${EPHEMERAL:-true}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - runner-work:/tmp/github-runner
+      - /tmp/github-runner:/tmp/github-runner
 
   runner-status:
     image: node:20-alpine
@@ -29,6 +29,4 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./status-app:/app:ro
-
-volumes:
-  runner-work:
+      - /tmp/github-runner:/tmp/github-runner

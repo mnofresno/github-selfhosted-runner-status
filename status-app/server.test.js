@@ -55,17 +55,19 @@ test('buildRunnerContainerSpec creates isolated ephemeral runner payload', () =>
     labels: ['self-hosted', 'linux', 'x64', 'gymnerd'],
     runnerImage: 'myoung34/github-runner:latest',
     runnerWorkdir: '/tmp/github-runner',
+    runnerHostWorkRoot: '/tmp/github-runner',
     runnerGroup: '',
   };
 
   const spec = buildRunnerContainerSpec(target, 'gymnerd-bot-runner-20260312');
 
-  assert.match(spec.volumeName, /^ghrunner-gymnerd-bot-/);
+  assert.equal(spec.hostWorkdir, '/tmp/github-runner/gymnerd-bot-runner-20260312');
   assert.ok(spec.body.Env.includes('RUNNER_SCOPE=repo'));
   assert.ok(spec.body.Env.includes('EPHEMERAL=true'));
   assert.ok(spec.body.Env.includes('REPO_URL=https://github.com/gymnerd-ar/gymnerd-bot'));
+  assert.ok(spec.body.Env.includes('COMPOSE_PROJECT_NAME=gymnerd-bot-runner-20260312'));
   assert.ok(spec.body.HostConfig.Binds.includes('/var/run/docker.sock:/var/run/docker.sock'));
-  assert.ok(spec.body.HostConfig.Binds.some((entry) => entry.endsWith(':/tmp/github-runner')));
+  assert.ok(spec.body.HostConfig.Binds.includes('/tmp/github-runner/gymnerd-bot-runner-20260312:/tmp/github-runner/gymnerd-bot-runner-20260312'));
 });
 
 test('parseListenPort ignores host bind strings and keeps internal default', () => {
