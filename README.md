@@ -63,6 +63,7 @@ Supported fields:
 - `accessToken`: optional per-target token override
 - `runnerImage`: optional image override
 - `runnerWorkdir`: optional workdir override
+- `dindImage`: optional Docker-in-Docker image override for isolated job Docker daemons
 
 Shared variables:
 
@@ -70,6 +71,7 @@ Shared variables:
 - `ACCESS_TOKEN`
 - `RUNNER_IMAGE`
 - `RUNNER_WORKDIR`
+- `DIND_IMAGE`
 - `STATUS_BIND`
 - `STATUS_INTERNAL_PORT`
 - `STATUS_PORT`
@@ -94,6 +96,18 @@ Example:
 
 ```yaml
 services:
+  runner-persistent-dind:
+    image: ${DIND_IMAGE:-docker:27-dind}
+    restart: unless-stopped
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ''
+    command:
+      - dockerd
+      - --host=tcp://127.0.0.1:2375
+      - --host=unix:///var/run/docker.sock
+      - --ip=127.0.0.1
+
   runner-persistent:
     image: ${RUNNER_IMAGE:-myoung34/github-runner:latest}
     restart: unless-stopped
@@ -106,11 +120,12 @@ services:
       REPO_URL: ${PERSISTENT_REPO_URL:-}
       LABELS: ${PERSISTENT_LABELS}
       DISABLE_AUTO_UPDATE: 'true'
-      EPHEMERAL: 'true'
+      EPHEMERAL: 'false'
       RUNNER_WORKDIR: ${PERSISTENT_RUNNER_WORKDIR:-/tmp/github-runner}
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ${PERSISTENT_HOST_WORKDIR:-/tmp/github-runner-persistent}:${PERSISTENT_RUNNER_WORKDIR:-/tmp/github-runner}
+      DOCKER_HOST: tcp://127.0.0.1:2375
+    depends_on:
+      - runner-persistent-dind
+    network_mode: service:runner-persistent-dind
 ```
 
 Set the values in a local `.env` or deployment secret store, for example:
@@ -162,6 +177,28 @@ Use repo-scoped runners when:
 
 ```bash
 docker compose up -d
+```
+
+## Isolation model
+
+Ephemeral runners launched from the fleet UI do not use the host Docker daemon directly.
+
+- each runner gets its own privileged `docker:dind` sidecar
+- the runner shares that sidecar network namespace and talks to it through `DOCKER_HOST=tcp://127.0.0.1:2375`
+- the inner Docker daemon starts with `--ip=127.0.0.1`, so published ports stay bound to localhost inside the runner namespace
+- workflow `docker compose` stacks stay inside that per-runner daemon instead of the server Docker engine
+
+That prevents CI jobs from seeing production containers, reusing production Docker networks, or publishing test ports on the host by accident.
+
+## Deployment
+
+For production on this server, deploy the checked-out repo from `/var/www/github-runner-fleet` and keep `.env` plus `docker-compose.override.yml` local to the server.
+
+This repo includes `.git-auto-deploy.yml` so the existing git-auto-deploy installation can run:
+
+```bash
+docker compose up -d --remove-orphans
+docker compose restart runner-status
 ```
 
 ## GitHub permissions

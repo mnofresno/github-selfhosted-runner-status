@@ -1,4 +1,18 @@
 services:
+  runner-dind:
+    image: ${DIND_IMAGE:-docker:27-dind}
+    restart: unless-stopped
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ''
+    command:
+      - dockerd
+      - --host=tcp://127.0.0.1:2375
+      - --host=unix:///var/run/docker.sock
+      - --ip=127.0.0.1
+    volumes:
+      - runner-docker:/var/lib/docker
+
   runner:
     image: ${RUNNER_IMAGE:-myoung34/github-runner:latest}
     restart: unless-stopped
@@ -8,9 +22,12 @@ services:
       RUNNER_SCOPE: ${RUNNER_SCOPE:-repo}
       DISABLE_AUTO_UPDATE: 'true'
       EPHEMERAL: ${EPHEMERAL:-true}
+      DOCKER_HOST: tcp://127.0.0.1:2375
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /tmp/github-runner:/tmp/github-runner
+      - runner-work:/tmp/github-runner
+    depends_on:
+      - runner-dind
+    network_mode: service:runner-dind
 
   runner-status:
     image: node:20-alpine
@@ -30,3 +47,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./status-app:/app:ro
       - /tmp/github-runner:/tmp/github-runner
+
+volumes:
+  runner-work:
+  runner-docker:

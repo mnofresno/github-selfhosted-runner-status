@@ -1,23 +1,17 @@
 const http = require('http');
 const https = require('https');
-const fs = require('fs/promises');
-const path = require('path');
 const { URL } = require('url');
-const {
-  buildCleanupPlan,
-  pruneDanglingResources,
-  shouldRunCleanup,
-} = require('./cleanup');
 
 const DEFAULT_PORT = 8080;
 const DEFAULT_WORKDIR = '/tmp/github-runner';
-const DEFAULT_HOST_WORK_ROOT = '/tmp/github-runner';
-const DEFAULT_CLEANUP_INTERVAL_MS = Number(process.env.CLEANUP_INTERVAL_MS || 60 * 1000);
 const DEFAULT_COMPOSE_PROJECT_NAME = 'github-runner-fleet';
+const DEFAULT_DIND_IMAGE = 'docker:27-dind';
 const LEGACY_COMPOSE_PROJECT_NAME = 'github-selfhosted';
 const MANAGED_LABEL = 'io.github-runner-fleet.managed';
 const MANAGED_TARGET_LABEL = 'io.github-runner-fleet.target-id';
 const MANAGED_RUNNER_LABEL = 'io.github-runner-fleet.runner-name';
+const MANAGED_ROLE_LABEL = 'io.github-runner-fleet.role';
+const MANAGED_STACK_LABEL = 'io.github-runner-fleet.stack-id';
 const LEGACY_MANAGED_LABEL = 'io.github-selfhosted.managed';
 const LEGACY_MANAGED_TARGET_LABEL = 'io.github-selfhosted.target-id';
 const LEGACY_MANAGED_RUNNER_LABEL = 'io.github-selfhosted.runner-name';
@@ -134,6 +128,32 @@ function isManagedResource(labels) {
   return labels?.[MANAGED_LABEL] === 'true' || labels?.[LEGACY_MANAGED_LABEL] === 'true';
 }
 
+function isManagedRunnerResource(labels) {
+  if (labels?.[MANAGED_LABEL] === 'true') {
+    return labels?.[MANAGED_ROLE_LABEL] === 'runner';
+  }
+  return labels?.[LEGACY_MANAGED_LABEL] === 'true';
+}
+
+function acceptedComposeProjects() {
+  return new Set([
+    process.env.COMPOSE_PROJECT_NAME || DEFAULT_COMPOSE_PROJECT_NAME,
+    LEGACY_COMPOSE_PROJECT_NAME,
+  ]);
+}
+
+function isPersistentComposeRunner(labels) {
+  const service = labels?.['com.docker.compose.service'] || '';
+  const project = labels?.['com.docker.compose.project'] || '';
+  if (!acceptedComposeProjects().has(project)) {
+    return false;
+  }
+  if (!service.startsWith('runner')) {
+    return false;
+  }
+  return !service.endsWith('-dind') && service !== 'runner-status';
+}
+
 function slugify(value) {
   return String(value || '')
     .trim()
@@ -188,7 +208,7 @@ function normalizeTarget(input, env, index) {
   const token = input.accessToken || input.ACCESS_TOKEN || env.ACCESS_TOKEN || '';
   const image = input.runnerImage || input.RUNNER_IMAGE || env.RUNNER_IMAGE || 'myoung34/github-runner:latest';
   const workdir = input.runnerWorkdir || input.RUNNER_WORKDIR || env.RUNNER_WORKDIR || DEFAULT_WORKDIR;
-  const hostWorkRoot = input.runnerHostWorkRoot || input.RUNNER_HOST_WORK_ROOT || env.RUNNER_HOST_WORK_ROOT || DEFAULT_HOST_WORK_ROOT;
+  const dindImage = input.dindImage || input.DIND_IMAGE || env.DIND_IMAGE || DEFAULT_DIND_IMAGE;
   const name = input.name || id;
 
   if (!id) {
@@ -213,12 +233,12 @@ function normalizeTarget(input, env, index) {
     scope,
     owner,
     repo,
-    repoUrl: scope === 'repo' ? `https://github.com/${owner}/${repo}` : '',
+    repoUrl: owner && repo ? `https://github.com/${owner}/${repo}` : '',
     accessToken: token,
     labels,
     runnerImage: image,
     runnerWorkdir: workdir,
-    runnerHostWorkRoot: hostWorkRoot,
+    dindImage,
     runnerGroup: input.runnerGroup || input.RUNNER_GROUP || '',
     runnerNamePrefix: slugify(input.runnerNamePrefix || `${id}-runner`) || 'runner',
     default: Boolean(input.default),
@@ -254,35 +274,103 @@ function getTargetMap(targets) {
   return new Map(targets.map((target) => [target.id, target]));
 }
 
-async function listManagedRunnerContainers(targetId) {
-  const response = await docker('/containers/json?all=1');
-  if (response.statusCode < 200 || response.statusCode >= 300) {
-    throw new Error(`Docker API ${response.statusCode}`);
-  }
-
-  return response.body
-    .filter((container) => isManagedResource(container.Labels))
-    .map((container) => ({
-    id: container.Id,
-    shortId: container.Id.slice(0, 12),
-    name: (container.Names?.[0] || '').replace(/^\//, ''),
-    image: container.Image,
-    state: container.State,
-    status: container.Status,
-    created: container.Created,
-    targetId: managedLabelValue(container.Labels, MANAGED_TARGET_LABEL, LEGACY_MANAGED_TARGET_LABEL),
-    runnerName: managedLabelValue(container.Labels, MANAGED_RUNNER_LABEL, LEGACY_MANAGED_RUNNER_LABEL),
-  }))
-    .filter((container) => !targetId || container.targetId === targetId);
+function envMap(entries) {
+  return Object.fromEntries((entries || []).map((entry) => {
+    const separator = entry.indexOf('=');
+    if (separator === -1) {
+      return [entry, ''];
+    }
+    return [entry.slice(0, separator), entry.slice(separator + 1)];
+  }));
 }
 
-async function listAllContainers() {
+function targetHasRepoFeed(target) {
+  return Boolean(target.owner && target.repo);
+}
+
+function targetMatchesPersistentRunner(target, env) {
+  const runnerScope = String(env.RUNNER_SCOPE || '').toLowerCase();
+  const runnerLabels = new Set(parseLabels(env.LABELS));
+  const parsedRepo = parseRepoUrl(env.REPO_URL || '');
+  const runnerOwner = env.ORG_NAME || parsedRepo.owner;
+  const runnerRepo = parsedRepo.repo;
+
+  if (runnerScope && runnerScope !== target.scope) {
+    return false;
+  }
+  if (runnerOwner && runnerOwner !== target.owner) {
+    return false;
+  }
+  if (target.repo && runnerRepo && runnerRepo !== target.repo) {
+    return false;
+  }
+
+  const customTargetLabels = target.labels.filter((label) => !['self-hosted', 'linux', 'x64'].includes(label.toLowerCase()));
+  if (!customTargetLabels.length) {
+    return true;
+  }
+  return customTargetLabels.every((label) => runnerLabels.has(label));
+}
+
+async function inspectContainerEnvs(containerIds) {
+  const inspected = await Promise.all(containerIds.map(async (containerId) => {
+    const response = await docker(`/containers/${containerId}/json`);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw new Error(`Container inspect failed with status ${response.statusCode}`);
+    }
+    return response.body;
+  }));
+  return new Map(inspected.map((container) => [container.Id, envMap(container.Config?.Env)]));
+}
+
+async function listManagedRunnerContainers(targetId, target = null) {
   const response = await docker('/containers/json?all=1');
   if (response.statusCode < 200 || response.statusCode >= 300) {
     throw new Error(`Docker API ${response.statusCode}`);
   }
 
-  return response.body;
+  const managed = response.body
+    .filter((container) => isManagedRunnerResource(container.Labels))
+    .map((container) => ({
+      id: container.Id,
+      shortId: container.Id.slice(0, 12),
+      name: (container.Names?.[0] || '').replace(/^\//, ''),
+      image: container.Image,
+      state: container.State,
+      status: container.Status,
+      created: container.Created,
+      targetId: managedLabelValue(container.Labels, MANAGED_TARGET_LABEL, LEGACY_MANAGED_TARGET_LABEL),
+      runnerName: managedLabelValue(container.Labels, MANAGED_RUNNER_LABEL, LEGACY_MANAGED_RUNNER_LABEL),
+      persistent: false,
+    }));
+
+  const persistentCandidates = response.body.filter((container) => isPersistentComposeRunner(container.Labels));
+  const persistentEnvs = persistentCandidates.length ? await inspectContainerEnvs(persistentCandidates.map((container) => container.Id)) : new Map();
+  const persistent = persistentCandidates
+    .filter((container) => {
+      if (!target) {
+        return false;
+      }
+      return targetMatchesPersistentRunner(target, persistentEnvs.get(container.Id) || {});
+    })
+    .map((container) => {
+      const containerEnv = persistentEnvs.get(container.Id) || {};
+      return {
+        id: container.Id,
+        shortId: container.Id.slice(0, 12),
+        name: (container.Names?.[0] || '').replace(/^\//, ''),
+        image: container.Image,
+        state: container.State,
+        status: container.Status,
+        created: container.Created,
+        targetId: target?.id || '',
+        runnerName: containerEnv.RUNNER_NAME || (container.Names?.[0] || '').replace(/^\//, ''),
+        persistent: true,
+      };
+    });
+
+  return [...managed, ...persistent]
+    .filter((container) => !targetId || container.targetId === targetId);
 }
 
 async function getStaticRunnerContainer() {
@@ -290,10 +378,7 @@ async function getStaticRunnerContainer() {
   if (response.statusCode < 200 || response.statusCode >= 300) {
     throw new Error(`Docker API ${response.statusCode}`);
   }
-  const acceptedProjects = new Set([
-    process.env.COMPOSE_PROJECT_NAME || DEFAULT_COMPOSE_PROJECT_NAME,
-    LEGACY_COMPOSE_PROJECT_NAME,
-  ]);
+  const acceptedProjects = acceptedComposeProjects();
 
   return response.body.find((container) => (
     container.Labels?.['com.docker.compose.service'] === 'runner'
@@ -303,12 +388,33 @@ async function getStaticRunnerContainer() {
 
 function formatRunnerName(target) {
   const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
-  return `${target.runnerNamePrefix}-${stamp}-${stampFragment().slice(-6)}`;
+  return `${target.runnerNamePrefix}-${stamp}`;
+}
+
+function dindCommand() {
+  return [
+    'dockerd',
+    '--host=tcp://127.0.0.1:2375',
+    '--host=unix:///var/run/docker.sock',
+    '--ip=127.0.0.1',
+  ];
+}
+
+function buildManagedLabels(target, runnerName, role, stackId) {
+  return {
+    [MANAGED_LABEL]: 'true',
+    [MANAGED_TARGET_LABEL]: target.id,
+    [MANAGED_RUNNER_LABEL]: runnerName,
+    [MANAGED_ROLE_LABEL]: role,
+    [MANAGED_STACK_LABEL]: stackId,
+  };
 }
 
 function buildRunnerContainerSpec(target, runnerName) {
-  const hostWorkdir = path.posix.join(target.runnerHostWorkRoot, runnerName);
-  const runnerWorkdir = hostWorkdir;
+  const stackId = `${target.id}-${stampFragment()}`;
+  const runnerVolumeName = `ghrunner-work-${stackId}`;
+  const dockerVolumeName = `ghrunner-docker-${stackId}`;
+  const networkName = `ghrunner-net-${stackId}`;
   const labels = [
     ...target.labels,
     `target:${target.id}`,
@@ -319,12 +425,12 @@ function buildRunnerContainerSpec(target, runnerName) {
     `ACCESS_TOKEN=${target.accessToken}`,
     `RUNNER_SCOPE=${target.scope}`,
     `RUNNER_NAME=${runnerName}`,
-    `RUNNER_WORKDIR=${runnerWorkdir}`,
-    `COMPOSE_PROJECT_NAME=${runnerName}`,
+    `RUNNER_WORKDIR=${target.runnerWorkdir}`,
     `LABELS=${labels.join(',')}`,
     'EPHEMERAL=true',
     'DISABLE_AUTO_UPDATE=true',
     'RANDOM_RUNNER_SUFFIX=false',
+    'DOCKER_HOST=tcp://127.0.0.1:2375',
   ];
 
   if (target.scope === 'repo') {
@@ -338,19 +444,39 @@ function buildRunnerContainerSpec(target, runnerName) {
   }
 
   return {
-    hostWorkdir,
-    body: {
+    stackId,
+    networkName,
+    runnerVolumeName,
+    dockerVolumeName,
+    dindContainerName: dindContainerNameForStack(stackId),
+    runnerContainerName: `runner-${stackId}`.slice(0, 63),
+    dindBody: {
+      Image: target.dindImage,
+      Env: ['DOCKER_TLS_CERTDIR='],
+      Cmd: dindCommand(),
+      Hostname: 'docker',
+      Labels: buildManagedLabels(target, runnerName, 'dind', stackId),
+      HostConfig: {
+        Privileged: true,
+        NetworkMode: networkName,
+        Binds: [
+          `${dockerVolumeName}:/var/lib/docker`,
+        ],
+      },
+      NetworkingConfig: {
+        EndpointsConfig: {
+          [networkName]: {},
+        },
+      },
+    },
+    runnerBody: {
       Image: target.runnerImage,
       Env: env,
-      Labels: {
-        [MANAGED_LABEL]: 'true',
-        [MANAGED_TARGET_LABEL]: target.id,
-        [MANAGED_RUNNER_LABEL]: runnerName,
-      },
+      Labels: buildManagedLabels(target, runnerName, 'runner', stackId),
       HostConfig: {
+        NetworkMode: `container:${dindContainerNameForStack(stackId)}`,
         Binds: [
-          '/var/run/docker.sock:/var/run/docker.sock',
-          `${hostWorkdir}:${runnerWorkdir}`,
+          `${runnerVolumeName}:${target.runnerWorkdir}`,
         ],
       },
     },
@@ -361,35 +487,186 @@ function stampFragment() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-async function launchRunner(target) {
-  const runnerName = formatRunnerName(target);
-  const containerName = `runner-${target.id}-${stampFragment()}`.slice(0, 63);
-  const spec = buildRunnerContainerSpec(target, runnerName);
+function dindContainerNameForStack(stackId) {
+  return `docker-${stackId}`.slice(0, 63);
+}
 
-  const createResponse = await docker(`/containers/create?name=${encodeURIComponent(containerName)}`, {
+async function createVolume(name, labels = {}) {
+  const response = await docker('/volumes/create', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(spec.body),
+    body: JSON.stringify({
+      Name: name,
+      Labels: {
+        [MANAGED_LABEL]: 'true',
+        ...labels,
+      },
+    }),
   });
-
-  if (createResponse.statusCode < 200 || createResponse.statusCode >= 300) {
-    throw new Error(`Container create failed with status ${createResponse.statusCode}`);
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(`Volume create failed with status ${response.statusCode}`);
   }
+}
 
-  const containerId = createResponse.body.Id;
-  const startResponse = await docker(`/containers/${containerId}/start`, { method: 'POST' });
-  if (![204, 304].includes(startResponse.statusCode)) {
-    await docker(`/containers/${containerId}?force=1`, { method: 'DELETE' }).catch(() => {});
-    throw new Error(`Container start failed with status ${startResponse.statusCode}`);
+async function removeVolume(name) {
+  const response = await docker(`/volumes/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  if (![204, 404].includes(response.statusCode)) {
+    throw new Error(`Volume delete failed with status ${response.statusCode}`);
   }
+}
 
-  return {
-    targetId: target.id,
-    runnerName,
-    containerId,
-    containerName,
-    hostWorkdir: spec.hostWorkdir,
+async function listManagedContainersByStack(stackId) {
+  const filters = encodeURIComponent(JSON.stringify({
+    label: [`${MANAGED_STACK_LABEL}=${stackId}`],
+  }));
+  const response = await docker(`/containers/json?all=1&filters=${filters}`);
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(`Docker API ${response.statusCode}`);
+  }
+  return response.body;
+}
+
+async function listManagedVolumesByStack(stackId) {
+  const filters = encodeURIComponent(JSON.stringify({
+    label: [`${MANAGED_STACK_LABEL}=${stackId}`],
+  }));
+  const response = await docker(`/volumes?filters=${filters}`);
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(`Docker API ${response.statusCode}`);
+  }
+  return response.body.Volumes || [];
+}
+
+async function createNetwork(name, labels = {}) {
+  const response = await docker('/networks/create', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      Name: name,
+      Driver: 'bridge',
+      Labels: {
+        [MANAGED_LABEL]: 'true',
+        ...labels,
+      },
+    }),
+  });
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(`Network create failed with status ${response.statusCode}`);
+  }
+}
+
+async function listManagedNetworksByStack(stackId) {
+  const filters = encodeURIComponent(JSON.stringify({
+    label: [`${MANAGED_STACK_LABEL}=${stackId}`],
+  }));
+  const response = await docker(`/networks?filters=${filters}`);
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(`Docker API ${response.statusCode}`);
+  }
+  return response.body;
+}
+
+async function removeNetwork(name) {
+  const response = await docker(`/networks/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  if (![204, 404].includes(response.statusCode)) {
+    throw new Error(`Network delete failed with status ${response.statusCode}`);
+  }
+}
+
+async function createContainer(name, body) {
+  const response = await docker(`/containers/create?name=${encodeURIComponent(name)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(`Container create failed with status ${response.statusCode}`);
+  }
+  return response.body.Id;
+}
+
+async function startContainer(containerId) {
+  const response = await docker(`/containers/${containerId}/start`, { method: 'POST' });
+  if (![204, 304].includes(response.statusCode)) {
+    throw new Error(`Container start failed with status ${response.statusCode}`);
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForDockerDaemon(containerId, timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const response = await dockerText(`/containers/${containerId}/logs?stdout=1&stderr=1&tail=100`);
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      const logs = response.body || '';
+      if (
+        logs.includes('API listen on [::]:2375')
+        || logs.includes('API listen on 0.0.0.0:2375')
+        || logs.includes('API listen on 127.0.0.1:2375')
+        || logs.includes('Daemon has completed initialization')
+      ) {
+        return;
+      }
+    }
+    await sleep(500);
+  }
+  throw new Error(`Docker daemon did not become ready for container ${containerId.slice(0, 12)}`);
+}
+
+async function removeManagedStack(stackId) {
+  const [containers, volumes, networks] = await Promise.all([
+    listManagedContainersByStack(stackId).catch(() => []),
+    listManagedVolumesByStack(stackId).catch(() => []),
+    listManagedNetworksByStack(stackId).catch(() => []),
+  ]);
+
+  for (const container of containers) {
+    await docker(`/containers/${container.Id}?force=1`, { method: 'DELETE' }).catch(() => {});
+  }
+  for (const volume of volumes) {
+    await removeVolume(volume.Name).catch(() => {});
+  }
+  for (const network of networks) {
+    await removeNetwork(network.Name).catch(() => {});
+  }
+}
+
+async function launchRunner(target) {
+  const runnerName = formatRunnerName(target);
+  const spec = buildRunnerContainerSpec(target, runnerName);
+  const stackLabels = {
+    [MANAGED_STACK_LABEL]: spec.stackId,
+    [MANAGED_TARGET_LABEL]: target.id,
+    [MANAGED_RUNNER_LABEL]: runnerName,
   };
+
+  try {
+    await createNetwork(spec.networkName, stackLabels);
+    await createVolume(spec.runnerVolumeName, stackLabels);
+    await createVolume(spec.dockerVolumeName, stackLabels);
+
+    const dindContainerId = await createContainer(spec.dindContainerName, spec.dindBody);
+    await startContainer(dindContainerId);
+    await waitForDockerDaemon(dindContainerId);
+
+    const containerId = await createContainer(spec.runnerContainerName, spec.runnerBody);
+    await startContainer(containerId);
+
+    return {
+      targetId: target.id,
+      runnerName,
+      containerId,
+      containerName: spec.runnerContainerName,
+      volumeName: spec.runnerVolumeName,
+      stackId: spec.stackId,
+    };
+  } catch (error) {
+    await removeManagedStack(spec.stackId).catch(() => {});
+    throw error;
+  }
 }
 
 async function inspectContainer(containerId) {
@@ -402,50 +679,34 @@ async function inspectContainer(containerId) {
 
 async function removeManagedRunner(containerId) {
   const inspected = await inspectContainer(containerId);
-  const hostDirectories = (inspected.Mounts || [])
-    .filter((mount) => mount.Type === 'bind' && mount.Source && mount.Source.startsWith(`${DEFAULT_HOST_WORK_ROOT}/`))
-    .map((mount) => mount.Source);
+  const stackId = inspected.Config?.Labels?.[MANAGED_STACK_LABEL];
+
+  if (stackId) {
+    await removeManagedStack(stackId);
+    return {
+      containerId,
+      stackId,
+      removedVolumes: [],
+    };
+  }
+
+  const volumeNames = (inspected.Mounts || [])
+    .filter((mount) => mount.Type === 'volume' && mount.Name)
+    .map((mount) => mount.Name);
 
   const removeResponse = await docker(`/containers/${containerId}?force=1`, { method: 'DELETE' });
   if (![204, 404].includes(removeResponse.statusCode)) {
     throw new Error(`Container delete failed with status ${removeResponse.statusCode}`);
   }
 
-  for (const hostDirectory of hostDirectories) {
-    await fs.rm(hostDirectory, { recursive: true, force: true }).catch(() => {});
+  for (const volumeName of volumeNames) {
+    await removeVolume(volumeName).catch(() => {});
   }
 
   return {
     containerId,
-    removedVolumes: [],
-    removedWorkdirs: hostDirectories,
+    removedVolumes: volumeNames,
   };
-}
-
-async function removeContainer(containerId) {
-  const response = await docker(`/containers/${containerId}?force=1`, { method: 'DELETE' });
-  if (![204, 404].includes(response.statusCode)) {
-    throw new Error(`Container delete failed with status ${response.statusCode}`);
-  }
-}
-
-async function listComposeNetworks(projectName) {
-  const filters = encodeURIComponent(JSON.stringify({
-    label: [`com.docker.compose.project=${projectName}`],
-  }));
-  const response = await docker(`/networks?filters=${filters}`);
-  if (response.statusCode < 200 || response.statusCode >= 300) {
-    throw new Error(`Network list failed with status ${response.statusCode}`);
-  }
-
-  return response.body || [];
-}
-
-async function removeNetwork(networkId) {
-  const response = await docker(`/networks/${encodeURIComponent(networkId)}`, { method: 'DELETE' });
-  if (![204, 404].includes(response.statusCode)) {
-    throw new Error(`Network delete failed with status ${response.statusCode}`);
-  }
 }
 
 async function githubRunnersForTarget(target) {
@@ -459,7 +720,7 @@ async function githubRunnersForTarget(target) {
 }
 
 async function latestRunsForTarget(target) {
-  if (target.scope !== 'repo') {
+  if (!targetHasRepoFeed(target)) {
     return [];
   }
 
@@ -476,7 +737,7 @@ async function latestRunsForTarget(target) {
 }
 
 async function listRunJobs(target, runId) {
-  if (target.scope !== 'repo') {
+  if (!targetHasRepoFeed(target)) {
     return [];
   }
 
@@ -530,7 +791,10 @@ async function killMatchingManagedRunner(runnerNames) {
     throw new Error(`Docker API ${response.statusCode}`);
   }
 
-  const targets = response.body.filter((container) => runnerNames.includes(container.Labels?.[MANAGED_RUNNER_LABEL]));
+  const targets = response.body.filter((container) => (
+    isManagedRunnerResource(container.Labels)
+    && runnerNames.includes(container.Labels?.[MANAGED_RUNNER_LABEL])
+  ));
   const results = [];
 
   for (const container of targets) {
@@ -608,7 +872,7 @@ async function getTargetStatus(target) {
   const [githubRunners, latestRuns, localRunners] = await Promise.all([
     githubRunnersForTarget(target),
     latestRunsForTarget(target),
-    listManagedRunnerContainers(target.id),
+    listManagedRunnerContainers(target.id, target),
   ]);
 
   const activeRun = latestRuns.find((run) => run.status !== 'completed') || null;
@@ -620,7 +884,7 @@ async function getTargetStatus(target) {
     scope: target.scope,
     owner: target.owner,
     repo: target.repo,
-    repository: target.scope === 'repo' ? `${target.owner}/${target.repo}` : target.owner,
+    repository: targetHasRepoFeed(target) ? `${target.owner}/${target.repo}` : target.owner,
     description: target.description,
     labels: target.labels,
     localRunners,
@@ -644,66 +908,16 @@ async function getStatus(targets) {
     targetStatuses.push(await getTargetStatus(target));
   }
 
-  const managedRunners = await listManagedRunnerContainers();
+  const managedRunners = Array.from(new Map(
+    targetStatuses
+      .flatMap((target) => target.localRunners)
+      .map((runner) => [runner.id, runner]),
+  ).values());
   return {
     generatedAt: new Date().toISOString(),
     targets: targetStatuses,
     managedRunners,
   };
-}
-
-async function runCleanupCycle(targets, cleanupState) {
-  const status = await getStatus(targets);
-  const decision = shouldRunCleanup({ status, cleanupState });
-  cleanupState.lastReason = decision.reason;
-  if (!decision.ok) {
-    return { skipped: true, reason: decision.reason };
-  }
-
-  cleanupState.running = true;
-  cleanupState.lastRunAt = Date.now();
-
-  try {
-    const dockerContainers = await listAllContainers();
-    const plan = buildCleanupPlan({ status, dockerContainers });
-    const removed = {
-      managedRunnerContainers: [],
-      composeProjects: [],
-      workdirs: [],
-      networks: [],
-    };
-
-    for (const containerId of plan.staleManagedRunnerIds) {
-      await removeContainer(containerId);
-      removed.managedRunnerContainers.push(containerId);
-    }
-
-    for (const project of plan.staleComposeProjects) {
-      for (const containerId of project.containerIds) {
-        await removeContainer(containerId);
-      }
-
-      const networks = await listComposeNetworks(project.project);
-      for (const network of networks) {
-        await removeNetwork(network.Id);
-        removed.networks.push(network.Name || network.Id);
-      }
-
-      await fs.rm(project.workdir, { recursive: true, force: true });
-      removed.composeProjects.push(project.project);
-      removed.workdirs.push(project.workdir);
-    }
-
-    const pruned = await pruneDanglingResources(docker);
-    cleanupState.lastSummary = { removed, pruned };
-    cleanupState.lastError = '';
-    return { skipped: false, removed, pruned };
-  } catch (error) {
-    cleanupState.lastError = error instanceof Error ? error.message : String(error);
-    throw error;
-  } finally {
-    cleanupState.running = false;
-  }
 }
 
 function renderLabelList(labels) {
@@ -719,13 +933,13 @@ function renderTone(value, tone) {
 
 function renderManagedRunnerRows(target) {
   if (!target.localRunners.length) {
-    return '<tr><td colspan="5">No app-launched containers for this target.</td></tr>';
+    return '<tr><td colspan="5">No visible runner containers for this target.</td></tr>';
   }
 
   return target.localRunners.map((runner) => {
-    const action = runner.state === 'running'
-      ? `<button class="danger" data-container-id="${escapeHtml(runner.id)}" data-action="kill-runner">Force kill</button>`
-      : '<span class="muted">auto-cleanup pending</span>';
+    const action = runner.persistent
+      ? '<span class="muted">Persistent</span>'
+      : `<button class="danger" data-container-id="${escapeHtml(runner.id)}" data-action="remove-runner">Remove</button>`;
     return `<tr><td><code>${escapeHtml(runner.runnerName || runner.name)}</code></td><td>${escapeHtml(runner.state)}</td><td>${escapeHtml(runner.status)}</td><td>${escapeHtml(new Date(runner.created * 1000).toISOString())}</td><td>${action}</td></tr>`;
   }).join('');
 }
@@ -741,8 +955,8 @@ function renderGithubRunnerRows(target) {
 }
 
 function renderRunRows(target) {
-  if (target.scope !== 'repo') {
-    return '<tr><td colspan="6">Run history is shown per repository. This target is org-scoped.</td></tr>';
+  if (!targetHasRepoFeed(target)) {
+    return '<tr><td colspan="6">Run history is unavailable until a repository is configured for this target.</td></tr>';
   }
   if (!target.latestRuns.length) {
     return '<tr><td colspan="6">No recent runs.</td></tr>';
@@ -772,7 +986,7 @@ function renderActiveJobsRows(target) {
 }
 
 function renderTargetCard(target) {
-  const repositoryLabel = target.scope === 'repo' ? target.repository : target.owner;
+  const repositoryLabel = targetHasRepoFeed(target) ? target.repository : target.owner;
   const activeRunCopy = target.activeRun
     ? `Active run ${escapeHtml(target.activeRun.id)}`
     : 'No active run';
@@ -826,7 +1040,7 @@ function renderTargetCard(target) {
         <section class="subcard">
           <div class="section-head section-head-tight">
             <h3>Run Feed</h3>
-            <span class="muted">${target.scope === 'repo' ? escapeHtml(target.repository) : 'repo controls unavailable'}</span>
+            <span class="muted">${targetHasRepoFeed(target) ? escapeHtml(target.repository) : 'repo controls unavailable'}</span>
           </div>
           <table>
             <thead><tr><th>Run</th><th>Event</th><th>Status</th><th>Conclusion</th><th>Created</th><th>Action</th></tr></thead>
@@ -931,7 +1145,7 @@ function render(status) {
         <h1>GitHub Runner Fleet</h1>
         <p class="muted">Ephemeral runners by target, with GitHub registration state and repo-level run controls where that scope exists.</p>
         <p class="muted">Updated <code>${escapeHtml(status.generatedAt)}</code></p>
-        <p id="action-status" class="muted">Launch creates a fresh runner container for one target. Idle ephemeral runners are cleaned up automatically; force-kill is only for active containers.</p>
+        <p id="action-status" class="muted">Launch creates a fresh runner container for one target. Remove deletes that container and its work volume.</p>
       </section>
       <section class="metric"><span>Targets</span><strong>${status.targets.length}</strong></section>
       <section class="metric"><span>Managed containers</span><strong>${managedCount}</strong></section>
@@ -980,20 +1194,20 @@ function render(status) {
       }
     }
 
-    async function killRunner(containerId) {
-      const confirmed = window.confirm('Force kill this active runner container?');
+    async function removeRunner(containerId) {
+      const confirmed = window.confirm('Remove this managed runner container and its work volume?');
       if (!confirmed) {
         return;
       }
 
       setBusy(true);
-      statusNode.textContent = 'Force killing runner container ' + containerId.slice(0, 12) + '...';
+      statusNode.textContent = 'Removing runner container ' + containerId.slice(0, 12) + '...';
       try {
         await callJson('/api/managed-runners/' + containerId + '/remove', { method: 'POST' });
-        statusNode.textContent = 'Runner killed. Reloading...';
+        statusNode.textContent = 'Runner removed. Reloading...';
         window.setTimeout(() => window.location.reload(), 1200);
       } catch (error) {
-        statusNode.textContent = 'Force kill failed: ' + error.message;
+        statusNode.textContent = 'Remove failed: ' + error.message;
         setBusy(false);
       }
     }
@@ -1091,8 +1305,8 @@ function render(status) {
         const action = button.dataset.action;
         if (action === 'launch-runner') {
           launchRunner(button.dataset.targetId);
-        } else if (action === 'kill-runner') {
-          killRunner(button.dataset.containerId);
+        } else if (action === 'remove-runner') {
+          removeRunner(button.dataset.containerId);
         } else if (action === 'show-jobs') {
           showJobs(button.dataset.targetId, button.dataset.runId);
         } else if (action === 'force-cancel') {
@@ -1138,26 +1352,8 @@ function sendHtml(res, statusCode, html) {
 
 function createServer(targets = loadTargets()) {
   const targetMap = getTargetMap(targets);
-  const cleanupState = {
-    running: false,
-    lastRunAt: 0,
-    lastReason: 'not-started',
-    lastSummary: null,
-    lastError: '',
-  };
 
-  const cleanupTick = async () => {
-    try {
-      await runCleanupCycle(targets, cleanupState);
-    } catch (_error) {
-      // Keep serving status even if cleanup has a transient failure.
-    }
-  };
-
-  cleanupTick();
-  const cleanupTimer = setInterval(cleanupTick, DEFAULT_CLEANUP_INTERVAL_MS);
-
-  const server = http.createServer(async (req, res) => {
+  return http.createServer(async (req, res) => {
     try {
       await readRequestBody(req);
       const requestUrl = new URL(req.url, 'http://localhost');
@@ -1243,10 +1439,7 @@ function createServer(targets = loadTargets()) {
 
       const status = await getStatus(targets);
       if (requestUrl.pathname === '/api/status') {
-        sendJson(res, 200, {
-          ...status,
-          cleanup: cleanupState,
-        });
+        sendJson(res, 200, status);
         return;
       }
 
@@ -1255,9 +1448,6 @@ function createServer(targets = loadTargets()) {
       sendJson(res, 500, { error: error.message });
     }
   });
-
-  server.on('close', () => clearInterval(cleanupTimer));
-  return server;
 }
 
 if (require.main === module) {
@@ -1273,6 +1463,5 @@ module.exports = {
   parseListenPort,
   parseRepoUrl,
   parseTargetsJson,
-  runCleanupCycle,
   slugify,
 };
