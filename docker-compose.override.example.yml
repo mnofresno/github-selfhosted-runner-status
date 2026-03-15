@@ -1,0 +1,17 @@
+services:
+  runner-gymnerd:
+    image: ${RUNNER_IMAGE:-myoung34/github-runner:latest}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      RUNNER_NAME: gymnerd-org-runner-1
+      RUNNER_SCOPE: org
+      ORG_NAME: gymnerd-ar
+      LABELS: self-hosted,linux,x64,gymnerd,shared
+      DISABLE_AUTO_UPDATE: 'true'
+      EPHEMERAL: 'true'
+      RUNNER_WORKDIR: /tmp/github-runner
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/github-runner-gymnerd:/tmp/github-runner

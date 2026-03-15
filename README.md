@@ -15,6 +15,7 @@ It keeps one baseline runner service in Compose and exposes a local UI that can:
 - `status-app/server.js`: GitHub API polling, Docker orchestration, HTML rendering
 - `status/index.html`: static fallback page
 - `.env.example`: sample environment
+- `docker-compose.override.example.yml`: sample persistent runner services for critical orgs
 
 ## Environment
 
@@ -75,6 +76,50 @@ Shared variables:
 - `COMPOSE_PROJECT_NAME`
 
 Legacy single-target variables such as `REPO_URL`, `RUNNER_NAME`, and `RUNNER_SCOPE` still work for the baseline compose runner.
+
+## Pragmatic production setup
+
+The fleet UI can launch ephemeral runners per target, but it does not autoscale from queued jobs by itself.
+
+The pragmatic production model is:
+
+- keep one persistent baseline runner for each critical org
+- use the fleet UI or API to launch extra ephemeral runners only for burst capacity
+
+That prevents `main` from staying queued while still keeping the burst model available.
+
+Use a local `docker-compose.override.yml` for those extra baseline runners. A sample is included in `docker-compose.override.example.yml`.
+
+Example:
+
+```yaml
+services:
+  runner-gymnerd:
+    image: ${RUNNER_IMAGE:-myoung34/github-runner:latest}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      RUNNER_NAME: gymnerd-org-runner-1
+      RUNNER_SCOPE: org
+      ORG_NAME: gymnerd-ar
+      LABELS: self-hosted,linux,x64,gymnerd,shared
+      DISABLE_AUTO_UPDATE: 'true'
+      EPHEMERAL: 'true'
+      RUNNER_WORKDIR: /tmp/github-runner
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/github-runner-gymnerd:/tmp/github-runner
+```
+
+Then start it with:
+
+```bash
+cp docker-compose.override.example.yml docker-compose.override.yml
+docker compose up -d runner-gymnerd
+```
+
+Each runner is registered in exactly one scope. Do not try to register one persistent runner across multiple organizations.
 
 ## Ports
 
