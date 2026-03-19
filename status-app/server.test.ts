@@ -19,6 +19,7 @@ const {
   clearAutocompleteCache,
   loadPersistedTargets,
   saveTargets,
+  resolveClientDistDir,
 } = require('./server.ts');
 
 const fs = require('fs');
@@ -76,6 +77,12 @@ test('parseLabels handles array input', () => {
 
 test('parseLabels filters empty entries', () => {
   assert.deepEqual(parseLabels('a,,b,'), ['a', 'b']);
+});
+
+test('resolveClientDistDir points at an existing frontend build path when present', () => {
+  const clientDistDir = resolveClientDistDir();
+  assert.equal(typeof clientDistDir, 'string');
+  assert.ok(clientDistDir.endsWith(path.join('frontend', 'dist')));
 });
 
 /* ── parseListenPort ─────────────────────────────────────────────── */

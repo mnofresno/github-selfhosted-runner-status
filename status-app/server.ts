@@ -43,7 +43,15 @@ const MANAGED_TARGET_LABEL = 'io.github-runner-fleet.target-id';
 const MANAGED_RUNNER_LABEL = 'io.github-runner-fleet.runner-name';
 const MANAGED_ROLE_LABEL = 'io.github-runner-fleet.role';
 const MANAGED_STACK_LABEL = 'io.github-runner-fleet.stack-id';
-const CLIENT_DIST_DIR = path.join(__dirname, '..', 'frontend', 'dist');
+function resolveClientDistDir() {
+  const candidates = [
+    path.join(__dirname, '..', 'frontend', 'dist'),
+    path.join(__dirname, '..', '..', 'frontend', 'dist'),
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0];
+}
+
+const CLIENT_DIST_DIR = resolveClientDistDir();
 
 /* ── Utilities ──────────────────────────────────────────────────────── */
 
@@ -964,5 +972,5 @@ module.exports = {
   slugify, targetHasRepoFeed, normalizeAutocompleteItems, normalizeAccessibleOwners, resolveAutocompleteToken,
   validateTargetFormInput, buildAutocompleteCacheKey, readAutocompleteCache,
   writeAutocompleteCache, withAutocompleteCache, clearAutocompleteCache,
-  loadPersistedTargets, saveTargets, ensureRunnersForTarget,
+  loadPersistedTargets, saveTargets, ensureRunnersForTarget, resolveClientDistDir,
 };
