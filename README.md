@@ -1,6 +1,6 @@
 # GitHub Runner Fleet
 
-Self-hosted GitHub Actions runner manager with persistent runners, a React + TypeScript dashboard, and a Node runtime that serves the compiled frontend in production.
+Self-hosted GitHub Actions runner manager with a React + TypeScript dashboard and an Express backend written in TypeScript.
 
 ## Architecture
 
@@ -30,10 +30,10 @@ Runners are persistent. They stay connected to GitHub all the time, and the UI i
 ## Files
 
 - `frontend/`: React + TypeScript dashboard source
-- `status-app/server.js`: Docker orchestration, GitHub API integration, API routes, and static asset serving
-- `status-app/cleanup.js`: cleanup logic for stale managed resources
+- `status-app/server.ts`: Docker orchestration, GitHub API integration, Express routes, and static asset serving
+- `status-app/cleanup.ts`: cleanup logic for stale managed resources
 - `docker-compose.yml`: production-oriented container setup
-- `Dockerfile`: multi-stage image build for the frontend bundle and runtime
+- `Dockerfile`: multi-stage image build for the frontend bundle and compiled backend runtime
 
 ## Quick Start
 

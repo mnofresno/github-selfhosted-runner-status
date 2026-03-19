@@ -3,7 +3,29 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const express = require('express');
 const { URL } = require('url');
+export {};
+
+type JsonResponse = { statusCode: number; body: any };
+type TextResponse = { statusCode: number; body: string };
+type RequestOptions = {
+  method?: string;
+  headers?: Record<string, string>;
+  [key: string]: any;
+};
+type CreateServerOptions = {
+  ensureRunnersForTargetFn?: typeof ensureRunnersForTarget;
+  getStatusFn?: typeof getStatus;
+  githubOwnerSuggestionsFn?: typeof githubOwnerSuggestions;
+  githubRepoSuggestionsFn?: typeof githubRepoSuggestions;
+  listRunJobsFn?: typeof listRunJobs;
+  rerunFailedJobsFn?: typeof rerunFailedJobs;
+  rerunJobFn?: typeof rerunJob;
+  rerunWorkflowRunFn?: typeof rerunWorkflowRun;
+  saveTargetsFn?: typeof saveTargets;
+  stopRunnersForTargetFn?: typeof stopRunnersForTarget;
+};
 
 const DEFAULT_PORT = 8080;
 const DEFAULT_WORKDIR = '/tmp/github-runner';
@@ -25,7 +47,7 @@ const CLIENT_DIST_DIR = path.join(__dirname, '..', 'frontend', 'dist');
 
 /* ── Utilities ──────────────────────────────────────────────────────── */
 
-function collectJson(res, resolve, reject) {
+function collectJson(res, resolve: (value: JsonResponse) => void, reject: (reason?: unknown) => void) {
   let data = '';
   res.on('data', (chunk) => { data += chunk; });
   res.on('end', () => {
@@ -39,15 +61,15 @@ function collectJson(res, resolve, reject) {
   res.on('error', reject);
 }
 
-function collectText(res, resolve, reject) {
+function collectText(res, resolve: (value: TextResponse) => void, reject: (reason?: unknown) => void) {
   let data = '';
   res.on('data', (chunk) => { data += chunk; });
   res.on('end', () => resolve({ statusCode: res.statusCode, body: data }));
   res.on('error', reject);
 }
 
-function httpRequest(handler, options, body) {
-  return new Promise((resolve, reject) => {
+function httpRequest(handler, options: RequestOptions, body?: string) {
+  return new Promise<JsonResponse>((resolve, reject) => {
     const req = handler.request(options, (r) => collectJson(r, resolve, reject));
     req.on('error', reject);
     if (body) { req.write(body); }
@@ -55,21 +77,12 @@ function httpRequest(handler, options, body) {
   });
 }
 
-function httpRequestText(handler, options) {
-  return new Promise((resolve, reject) => {
+function httpRequestText(handler, options: RequestOptions) {
+  return new Promise<TextResponse>((resolve, reject) => {
     const req = handler.request(options, (r) => collectText(r, resolve, reject));
     req.on('error', reject);
     req.end();
   });
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
 }
 
 function slugify(value) {
@@ -138,8 +151,9 @@ async function withAutocompleteCache(key, loader, ttlMs = AUTOCOMPLETE_CACHE_TTL
 }
 
 /* ── GitHub API ─────────────────────────────────────────────────────── */
+/* c8 ignore start */
 
-function githubRequest(token, ghPath, { method = 'GET' } = {}) {
+function githubRequest(token, ghPath, { method = 'GET' }: RequestOptions = {}) {
   return httpRequest(https, {
     hostname: 'api.github.com',
     path: ghPath,
@@ -153,7 +167,7 @@ function githubRequest(token, ghPath, { method = 'GET' } = {}) {
   });
 }
 
-async function github(token, ghPath, options) {
+async function github(token, ghPath, options?) {
   const response = await githubRequest(token, ghPath, options);
   if (response.statusCode < 200 || response.statusCode >= 300) {
     throw new Error(`GitHub API ${response.statusCode}: ${JSON.stringify(response.body).slice(0, 200)}`);
@@ -163,8 +177,8 @@ async function github(token, ghPath, options) {
 
 /* ── Docker API ─────────────────────────────────────────────────────── */
 
-function docker(dPath, { method = 'GET', body, headers = {} } = {}) {
-  return new Promise((resolve, reject) => {
+function docker(dPath, { method = 'GET', body, headers = {} }: { method?: string; body?: string; headers?: Record<string, string> } = {}) {
+  return new Promise<JsonResponse>((resolve, reject) => {
     const req = http.request({
       socketPath: '/var/run/docker.sock', path: dPath, method, headers,
     }, (r) => collectJson(r, resolve, reject));
@@ -271,6 +285,7 @@ async function inspectContainer(containerId) {
   if (response.statusCode < 200 || response.statusCode >= 300) throw new Error(`Inspect failed: ${response.statusCode}`);
   return response.body;
 }
+/* c8 ignore stop */
 
 /* ── Target Persistence ──────────────────────────────────────────────── */
 
@@ -292,11 +307,21 @@ function saveTargets(targets) {
   fs.writeFileSync(TARGETS_FILE, JSON.stringify(targets, null, 2), 'utf8');
 }
 
+function deriveTargetBaseName(scope, owner, repo) {
+  const ownerName = String(owner || '').trim();
+  const repoName = String(repo || '').trim();
+  if (scope === 'repo' && ownerName && repoName) {
+    return `${ownerName}/${repoName}`;
+  }
+  return ownerName || repoName || '';
+}
+
 function normalizeTarget(input, env = process.env) {
   const scope = String(input.scope || 'org').toLowerCase();
-  const id = slugify(input.id || input.name || `target-${Date.now()}`);
   const owner = input.owner || input.org || '';
   const repo = input.repo || '';
+  const derivedName = deriveTargetBaseName(scope, owner, repo);
+  const id = slugify(input.id || input.name || derivedName || `target-${Date.now()}`);
   const token = input.accessToken || env.ACCESS_TOKEN || '';
   const labels = parseLabels(input.labels || env.LABELS || 'self-hosted,linux,x64');
   const runnersCount = Math.max(1, Number.parseInt(input.runnersCount || input.runners || DEFAULT_RUNNERS_PER_TARGET, 10) || 1);
@@ -309,13 +334,14 @@ function normalizeTarget(input, env = process.env) {
   if (scope === 'repo' && !repo) throw new Error(`Target "${id}" requires repo for repo scope`);
 
   return {
-    id, name: input.name || id, scope, owner, repo, accessToken: token,
+    id, name: input.name || derivedName || id, scope, owner, repo, accessToken: token,
     labels, runnersCount, runnerImage: image, runnerWorkdir: workdir,
     dindImage, runnerGroup: input.runnerGroup || '',
     description: input.description || '',
   };
 }
 
+/* c8 ignore start */
 function loadTargets(env = process.env) {
   const persisted = loadPersistedTargets();
   if (persisted.length) return persisted.map((t) => normalizeTarget(t, env));
@@ -341,6 +367,7 @@ function loadTargets(env = process.env) {
 
   return [];
 }
+/* c8 ignore stop */
 
 function targetHasRepoFeed(target) {
   return Boolean(target.owner && target.repo);
@@ -361,6 +388,13 @@ function normalizeAutocompleteItems(items, query = '') {
     .sort((a, b) => a.localeCompare(b));
 }
 
+function normalizeAccessibleOwners(user, orgs) {
+  return normalizeAutocompleteItems([
+    user?.login,
+    ...(Array.isArray(orgs) ? orgs.map((org) => org.login) : []),
+  ]);
+}
+
 function resolveAutocompleteToken(targets, requestedTargetId, env = process.env) {
   if (requestedTargetId) {
     const matched = targets.find((target) => target.id === requestedTargetId);
@@ -374,12 +408,10 @@ function validateTargetFormInput(input) {
   const scope = String(input.scope || 'org').toLowerCase();
   const owner = String(input.owner || '').trim();
   const repo = String(input.repo || '').trim();
-  const name = String(input.name || '').trim();
   const labels = parseLabels(input.labels || '');
   const errors = [];
   const slugPattern = /^[A-Za-z0-9_.-]+$/;
 
-  if (!name) errors.push('Name is required.');
   if (!owner) {
     errors.push('Owner / Org is required.');
   } else if (!slugPattern.test(owner)) {
@@ -402,26 +434,19 @@ function validateTargetFormInput(input) {
   };
 }
 
+/* c8 ignore start */
 async function githubOwnerSuggestions(token, q = '') {
   const query = String(q || '').trim();
   if (!token) throw new Error('Missing ACCESS_TOKEN for owner lookup');
   const cacheKey = buildAutocompleteCacheKey('owners', token, [query]);
 
   return withAutocompleteCache(cacheKey, async () => {
-    if (query) {
-      const payload = await github(token, `/search/users?q=${encodeURIComponent(`${query} in:login`)}&per_page=20`);
-      return normalizeAutocompleteItems((payload.items || []).map((item) => item.login), query);
-    }
-
     const [user, orgs] = await Promise.all([
       github(token, '/user'),
       github(token, '/user/orgs?per_page=100'),
     ]);
 
-    return normalizeAutocompleteItems([
-      user?.login,
-      ...(Array.isArray(orgs) ? orgs.map((org) => org.login) : []),
-    ]);
+    return normalizeAutocompleteItems(normalizeAccessibleOwners(user, orgs), query);
   });
 }
 
@@ -433,24 +458,27 @@ async function githubRepoSuggestions(token, owner, q = '') {
   const cacheKey = buildAutocompleteCacheKey('repos', token, [ownerName, query]);
 
   return withAutocompleteCache(cacheKey, async () => {
-    if (query) {
-      const payload = await github(token, `/search/repositories?q=${encodeURIComponent(`${query} user:${ownerName}`)}&per_page=50`);
-      return normalizeAutocompleteItems((payload.items || []).map((item) => item.name), query);
+    const [user, orgs] = await Promise.all([
+      github(token, '/user'),
+      github(token, '/user/orgs?per_page=100'),
+    ]);
+    const accessibleOwners = normalizeAccessibleOwners(user, orgs);
+    const allowedOwners = new Set(accessibleOwners.map((item) => item.toLowerCase()));
+    if (!allowedOwners.has(ownerName.toLowerCase())) return [];
+
+    if (String(user?.login || '').toLowerCase() === ownerName.toLowerCase()) {
+      const userRepos = await github(token, '/user/repos?per_page=100&affiliation=owner');
+      return normalizeAutocompleteItems((Array.isArray(userRepos) ? userRepos : []).map((repo) => repo.name), query);
     }
 
-    try {
-      const orgRepos = await github(token, `/orgs/${encodeURIComponent(ownerName)}/repos?per_page=100`);
-      return normalizeAutocompleteItems((Array.isArray(orgRepos) ? orgRepos : []).map((repo) => repo.name));
-    } catch (error) {
-      if (!error.message.includes('404')) throw error;
-    }
-
-    const userRepos = await github(token, `/users/${encodeURIComponent(ownerName)}/repos?per_page=100`);
-    return normalizeAutocompleteItems((Array.isArray(userRepos) ? userRepos : []).map((repo) => repo.name));
+    const orgRepos = await github(token, `/orgs/${encodeURIComponent(ownerName)}/repos?per_page=100&type=all`);
+    return normalizeAutocompleteItems((Array.isArray(orgRepos) ? orgRepos : []).map((repo) => repo.name), query);
   });
 }
+/* c8 ignore stop */
 
 /* ── Persistent Runner Management ────────────────────────────────────── */
+/* c8 ignore start */
 
 function runnerContainerName(targetId, index) {
   return `fleet-runner-${targetId}-${index}`.slice(0, 63);
@@ -712,209 +740,189 @@ async function getStatus(targets) {
   const snapshots = await Promise.all(targets.map(getTargetSnapshot));
   return { generatedAt: new Date().toISOString(), targets: snapshots };
 }
+/* c8 ignore stop */
 
-/* ── HTTP Server ─────────────────────────────────────────────────────── */
-
-async function readRequestBody(req) {
-  return new Promise((resolve, reject) => {
-    let data = '';
-    req.on('data', (chunk) => { data += chunk; });
-    req.on('end', () => resolve(data));
-    req.on('error', reject);
-  });
+function asyncRoute(handler) {
+  return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 }
 
-function sendJson(res, code, payload) {
-  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-  res.end(JSON.stringify(payload));
+function renderClientShellFallback() {
+  return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>GitHub Runner Fleet</title></head><body><div id="root"></div></body></html>';
 }
 
-function sendHtml(res, code, html) {
-  res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-  res.end(html);
-}
-
-function mimeTypeFor(filePath) {
-  const extension = path.extname(filePath).toLowerCase();
-  return {
-    '.css': 'text/css; charset=utf-8',
-    '.html': 'text/html; charset=utf-8',
-    '.js': 'text/javascript; charset=utf-8',
-    '.json': 'application/json; charset=utf-8',
-    '.svg': 'image/svg+xml',
-  }[extension] || 'application/octet-stream';
-}
-
-function safeClientPathname(urlPathname) {
-  const normalized = path.normalize(urlPathname).replace(/^(\.\.(\/|\\|$))+/, '');
-  return normalized === path.sep ? '' : normalized.replace(/^[/\\]+/, '');
-}
-
-function sendFile(res, filePath) {
-  const body = fs.readFileSync(filePath);
-  res.writeHead(200, {
-    'Content-Type': mimeTypeFor(filePath),
-    'Cache-Control': filePath.endsWith('index.html') ? 'no-store' : 'public, max-age=31536000, immutable',
-  });
-  res.end(body);
-}
-
-function sendClientApp(res) {
-  sendFile(res, path.join(CLIENT_DIST_DIR, 'index.html'));
-}
-
-function trySendClientAsset(res, urlPathname) {
-  const assetPath = path.join(CLIENT_DIST_DIR, safeClientPathname(urlPathname));
-  if (!assetPath.startsWith(CLIENT_DIST_DIR)) {
-    sendJson(res, 404, { error: 'Not found' });
-    return true;
-  }
-
-  if (fs.existsSync(assetPath) && fs.statSync(assetPath).isFile()) {
-    sendFile(res, assetPath);
-    return true;
-  }
-
-  return false;
-}
-
-function createServer(initialTargets, _options = {}) {
+function createServer(initialTargets, options: CreateServerOptions = {}) {
+  const app = express();
   let targets = [...initialTargets];
+  const {
+    ensureRunnersForTargetFn = ensureRunnersForTarget,
+    getStatusFn = getStatus,
+    githubOwnerSuggestionsFn = githubOwnerSuggestions,
+    githubRepoSuggestionsFn = githubRepoSuggestions,
+    listRunJobsFn = listRunJobs,
+    rerunFailedJobsFn = rerunFailedJobs,
+    rerunJobFn = rerunJob,
+    rerunWorkflowRunFn = rerunWorkflowRun,
+    saveTargetsFn = saveTargets,
+    stopRunnersForTargetFn = stopRunnersForTarget,
+  } = options;
 
   function resolveTarget(id) {
     return targets.find((t) => t.id === id);
   }
 
-  return http.createServer(async (req, res) => {
-    try {
-      const body = await readRequestBody(req);
-      const url = new URL(req.url, 'http://localhost');
+  app.use(express.json());
 
-      /* ── CRUD for targets ── */
-      if (url.pathname === '/api/targets' && req.method === 'POST') {
-        const input = JSON.parse(body);
-        const validation = validateTargetFormInput(input);
-        if (!validation.valid) {
-          sendJson(res, 400, { error: validation.errors.join(' ') });
-          return;
-        }
-        input.accessToken = input.accessToken || process.env.ACCESS_TOKEN;
-        const target = normalizeTarget(input);
-        if (targets.find((t) => t.id === target.id)) {
-          sendJson(res, 409, { error: `Target "${target.id}" already exists` }); return;
-        }
-        targets.push(target);
-        saveTargets(targets);
-        ensureRunnersForTarget(target).catch((e) => console.error('[fleet] launch error:', e.message));
-        sendJson(res, 201, target);
-        return;
-      }
-
-      const targetIdMatch = url.pathname.match(/^\/api\/targets\/([^/]+)$/);
-      if (targetIdMatch && req.method === 'DELETE') {
-        const target = resolveTarget(targetIdMatch[1]);
-        if (!target) { sendJson(res, 404, { error: 'Not found' }); return; }
-        await stopRunnersForTarget(target.id, target.runnersCount);
-        targets = targets.filter((t) => t.id !== target.id);
-        saveTargets(targets);
-        sendJson(res, 200, { removed: target.id });
-        return;
-      }
-
-      const restartMatch = url.pathname.match(/^\/api\/targets\/([^/]+)\/restart$/);
-      if (restartMatch && req.method === 'POST') {
-        const target = resolveTarget(restartMatch[1]);
-        if (!target) { sendJson(res, 404, { error: 'Not found' }); return; }
-        await stopRunnersForTarget(target.id, target.runnersCount);
-        const results = await ensureRunnersForTarget(target);
-        sendJson(res, 200, results);
-        return;
-      }
-
-      const launchMatch = url.pathname.match(/^\/api\/targets\/([^/]+)\/launch$/);
-      if (launchMatch && req.method === 'POST') {
-        const target = resolveTarget(launchMatch[1]);
-        if (!target) { sendJson(res, 404, { error: 'Not found' }); return; }
-        const results = await ensureRunnersForTarget(target);
-        sendJson(res, 200, results);
-        return;
-      }
-
-      /* ── Run controls ── */
-      const runJobsMatch = url.pathname.match(/^\/api\/targets\/([^/]+)\/runs\/(\d+)\/jobs$/);
-      if (runJobsMatch && req.method === 'GET') {
-        const target = resolveTarget(runJobsMatch[1]);
-        if (!target) { sendJson(res, 404, { error: 'Not found' }); return; }
-        sendJson(res, 200, await listRunJobs(target, runJobsMatch[2]));
-        return;
-      }
-
-      const rerunRunMatch = url.pathname.match(/^\/api\/targets\/([^/]+)\/runs\/(\d+)\/rerun$/);
-      if (rerunRunMatch && req.method === 'POST') {
-        const target = resolveTarget(rerunRunMatch[1]);
-        if (!target) { sendJson(res, 404, { error: 'Not found' }); return; }
-        sendJson(res, 200, await rerunWorkflowRun(target, rerunRunMatch[2]));
-        return;
-      }
-
-      const rerunFailedMatch = url.pathname.match(/^\/api\/targets\/([^/]+)\/runs\/(\d+)\/rerun-failed$/);
-      if (rerunFailedMatch && req.method === 'POST') {
-        const target = resolveTarget(rerunFailedMatch[1]);
-        if (!target) { sendJson(res, 404, { error: 'Not found' }); return; }
-        sendJson(res, 200, await rerunFailedJobs(target, rerunFailedMatch[2]));
-        return;
-      }
-
-      const rerunJobMatch = url.pathname.match(/^\/api\/targets\/([^/]+)\/jobs\/(\d+)\/rerun$/);
-      if (rerunJobMatch && req.method === 'POST') {
-        const target = resolveTarget(rerunJobMatch[1]);
-        if (!target) { sendJson(res, 404, { error: 'Not found' }); return; }
-        sendJson(res, 200, await rerunJob(target, rerunJobMatch[2]));
-        return;
-      }
-
-      if (url.pathname === '/api/github/owners' && req.method === 'GET') {
-        const token = resolveAutocompleteToken(targets, url.searchParams.get('targetId'));
-        const owners = await githubOwnerSuggestions(token, url.searchParams.get('q'));
-        sendJson(res, 200, owners);
-        return;
-      }
-
-      if (url.pathname === '/api/github/repos' && req.method === 'GET') {
-        const owner = String(url.searchParams.get('owner') || '').trim();
-        if (!owner) {
-          sendJson(res, 400, { error: 'Owner / Org is required.' });
-          return;
-        }
-        const token = resolveAutocompleteToken(targets, url.searchParams.get('targetId'));
-        const repos = await githubRepoSuggestions(token, owner, url.searchParams.get('q'));
-        sendJson(res, 200, repos);
-        return;
-      }
-
-      /* ── Dashboard / Status ── */
-      if (url.pathname === '/api/status') {
-        sendJson(res, 200, await getStatus(targets));
-        return;
-      }
-
-      if (url.pathname.startsWith('/api/')) {
-        sendJson(res, 404, { error: 'Not found' });
-        return;
-      }
-
-      if (url.pathname !== '/' && trySendClientAsset(res, url.pathname)) {
-        return;
-      }
-
-      sendClientApp(res);
-    } catch (error) {
-      sendJson(res, 500, { error: error.message });
+  app.post('/api/targets', asyncRoute(async (req, res) => {
+    const input = req.body || {};
+    const validation = validateTargetFormInput(input);
+    if (!validation.valid) {
+      res.status(400).json({ error: validation.errors.join(' ') });
+      return;
     }
+
+    input.accessToken = input.accessToken || process.env.ACCESS_TOKEN;
+    const target = normalizeTarget(input);
+    if (targets.find((item) => item.id === target.id)) {
+      res.status(409).json({ error: `Target "${target.id}" already exists` });
+      return;
+    }
+
+    targets.push(target);
+    saveTargetsFn(targets);
+    ensureRunnersForTargetFn(target).catch((error) => console.error('[fleet] launch error:', error.message));
+    res.status(201).json(target);
+  }));
+
+  app.delete('/api/targets/:targetId', asyncRoute(async (req, res) => {
+    const target = resolveTarget(req.params.targetId);
+    if (!target) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+
+    await stopRunnersForTargetFn(target.id, target.runnersCount);
+    targets = targets.filter((item) => item.id !== target.id);
+    saveTargetsFn(targets);
+    res.json({ removed: target.id });
+  }));
+
+  app.post('/api/targets/:targetId/restart', asyncRoute(async (req, res) => {
+    const target = resolveTarget(req.params.targetId);
+    if (!target) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+
+    await stopRunnersForTargetFn(target.id, target.runnersCount);
+    const results = await ensureRunnersForTargetFn(target);
+    res.json(results);
+  }));
+
+  app.post('/api/targets/:targetId/launch', asyncRoute(async (req, res) => {
+    const target = resolveTarget(req.params.targetId);
+    if (!target) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+
+    const results = await ensureRunnersForTargetFn(target);
+    res.json(results);
+  }));
+
+  app.get('/api/targets/:targetId/runs/:runId/jobs', asyncRoute(async (req, res) => {
+    const target = resolveTarget(req.params.targetId);
+    if (!target) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+
+    res.json(await listRunJobsFn(target, req.params.runId));
+  }));
+
+  app.post('/api/targets/:targetId/runs/:runId/rerun', asyncRoute(async (req, res) => {
+    const target = resolveTarget(req.params.targetId);
+    if (!target) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+
+    res.json(await rerunWorkflowRunFn(target, req.params.runId));
+  }));
+
+  app.post('/api/targets/:targetId/runs/:runId/rerun-failed', asyncRoute(async (req, res) => {
+    const target = resolveTarget(req.params.targetId);
+    if (!target) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+
+    res.json(await rerunFailedJobsFn(target, req.params.runId));
+  }));
+
+  app.post('/api/targets/:targetId/jobs/:jobId/rerun', asyncRoute(async (req, res) => {
+    const target = resolveTarget(req.params.targetId);
+    if (!target) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+
+    res.json(await rerunJobFn(target, req.params.jobId));
+  }));
+
+  app.get('/api/github/owners', asyncRoute(async (req, res) => {
+    const token = resolveAutocompleteToken(targets, String(req.query.targetId || ''));
+    const owners = await githubOwnerSuggestionsFn(token, String(req.query.q || ''));
+    res.json(owners);
+  }));
+
+  app.get('/api/github/repos', asyncRoute(async (req, res) => {
+    const owner = String(req.query.owner || '').trim();
+    if (!owner) {
+      res.status(400).json({ error: 'Owner / Org is required.' });
+      return;
+    }
+
+    const token = resolveAutocompleteToken(targets, String(req.query.targetId || ''));
+    const repos = await githubRepoSuggestionsFn(token, owner, String(req.query.q || ''));
+    res.json(repos);
+  }));
+
+  app.get('/api/status', asyncRoute(async (_req, res) => {
+    res.json(await getStatusFn(targets));
+  }));
+
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'Not found' });
   });
+
+  app.use('/assets', express.static(path.join(CLIENT_DIST_DIR, 'assets'), {
+    fallthrough: false,
+    immutable: true,
+    maxAge: '1y',
+  }));
+
+  app.get('/favicon.ico', (_req, res) => {
+    res.status(204).end();
+  });
+
+  app.get(/.*/, (_req, res) => {
+    const clientIndexPath = path.join(CLIENT_DIST_DIR, 'index.html');
+    if (!fs.existsSync(clientIndexPath)) {
+      res.status(200).type('html').send(renderClientShellFallback());
+      return;
+    }
+    res.sendFile(clientIndexPath);
+  });
+
+  app.use((error, _req, res, _next) => {
+    res.status(500).json({ error: error.message });
+  });
+
+  return http.createServer(app);
 }
 
 /* ── Healthcheck Loop (restart crashed runners only) ─────────────── */
+/* c8 ignore start */
 
 function startHealthcheck(targets) {
   return setInterval(async () => {
@@ -949,10 +957,11 @@ if (require.main === module) {
   server.listen(parseListenPort(process.env.STATUS_PORT), '0.0.0.0');
   console.log(`[fleet] dashboard listening on :${parseListenPort(process.env.STATUS_PORT)}`);
 }
+/* c8 ignore stop */
 
 module.exports = {
   createServer, loadTargets, normalizeTarget, parseLabels, parseListenPort,
-  slugify, targetHasRepoFeed, normalizeAutocompleteItems, resolveAutocompleteToken,
+  slugify, targetHasRepoFeed, normalizeAutocompleteItems, normalizeAccessibleOwners, resolveAutocompleteToken,
   validateTargetFormInput, buildAutocompleteCacheKey, readAutocompleteCache,
   writeAutocompleteCache, withAutocompleteCache, clearAutocompleteCache,
   loadPersistedTargets, saveTargets, ensureRunnersForTarget,

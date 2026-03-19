@@ -2,6 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  createServer,
   normalizeTarget,
   slugify,
   parseLabels,
@@ -18,11 +19,35 @@ const {
   clearAutocompleteCache,
   loadPersistedTargets,
   saveTargets,
-} = require('./server');
+} = require('./server.ts');
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { once } = require('node:events');
+
+async function startTestServer(initialTargets = [], options = {}) {
+  const server = createServer(initialTargets, options);
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  return {
+    server,
+    baseUrl: `http://127.0.0.1:${address.port}`,
+  };
+}
+
+async function requestJson(baseUrl, path, init = {}) {
+  const response = await fetch(`${baseUrl}${path}`, init);
+  const text = await response.text();
+  let body = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = text;
+  }
+  return { response, body };
+}
 
 /* ── slugify ─────────────────────────────────────────────────────── */
 
@@ -162,6 +187,11 @@ test('resolveAutocompleteToken falls back to env ACCESS_TOKEN', () => {
   assert.equal(token, 'env_tok');
 });
 
+test('resolveAutocompleteToken falls back to the first target token', () => {
+  const token = resolveAutocompleteToken([{ id: 'one', accessToken: 'tok_one' }], '', {});
+  assert.equal(token, 'tok_one');
+});
+
 /* ── Autocomplete cache ──────────────────────────────────────────── */
 
 test('buildAutocompleteCacheKey hashes token and normalizes parts', () => {
@@ -175,6 +205,17 @@ test('writeAutocompleteCache and readAutocompleteCache roundtrip until ttl expir
   writeAutocompleteCache('owners::x', ['gymnerd-ar'], 1200, 1000);
   assert.deepEqual(readAutocompleteCache('owners::x', 1001), ['gymnerd-ar']);
   assert.equal(readAutocompleteCache('owners::x', 2205), null);
+});
+
+test('writeAutocompleteCache evicts the oldest entry when the cache is full', () => {
+  clearAutocompleteCache();
+  for (let index = 0; index < 200; index += 1) {
+    writeAutocompleteCache(`owners::${index}`, [String(index)], 60_000, 1000 + index);
+  }
+  writeAutocompleteCache('owners::overflow', ['overflow'], 60_000, 5000);
+
+  assert.equal(readAutocompleteCache('owners::0', 5001), null);
+  assert.deepEqual(readAutocompleteCache('owners::overflow', 5001), ['overflow']);
 });
 
 test('withAutocompleteCache only invokes loader once before ttl expiry', async () => {
@@ -228,6 +269,18 @@ test('validateTargetFormInput rejects invalid owner slug', () => {
   assert.match(result.errors.join(' '), /Owner \/ Org can only contain/);
 });
 
+test('validateTargetFormInput rejects invalid repo slug', () => {
+  const result = validateTargetFormInput({
+    name: 'Bad Repo',
+    scope: 'repo',
+    owner: 'gymnerd-ar',
+    repo: 'bad repo',
+    labels: 'self-hosted',
+  });
+  assert.equal(result.valid, false);
+  assert.match(result.errors.join(' '), /Repository can only contain/);
+});
+
 test('validateTargetFormInput requires at least one label', () => {
   const result = validateTargetFormInput({
     name: 'No Labels',
@@ -266,4 +319,180 @@ test('saveTargets and loadPersistedTargets roundtrip', () => {
   // Cleanup
   fs.rmSync(tmpDir, { recursive: true, force: true });
   process.env.DATA_DIR = origDataDir;
+});
+
+test('createServer serves target management and GitHub helper routes', async () => {
+  const saveTargetsFn = async () => {};
+  const ensureRunnersForTargetFn = async (target) => [{ action: 'launched', targetId: target.id }];
+  const stopRunnersForTargetFn = async () => {};
+  const listRunJobsFn = async (_target, runId) => [{ id: Number(runId), name: 'lint' }];
+  const rerunWorkflowRunFn = async (_target, runId) => ({ runId, rerun: true });
+  const rerunFailedJobsFn = async (_target, runId) => ({ runId, failed: true });
+  const rerunJobFn = async (_target, jobId) => ({ jobId, rerun: true });
+  const githubOwnerSuggestionsFn = async (token, query) => [`${token}:${query}`];
+  const githubRepoSuggestionsFn = async (token, owner, query) => [`${token}:${owner}:${query}`];
+  const getStatusFn = async (targets) => ({ generatedAt: 'now', targets: targets.map((target) => ({ id: target.id })) });
+
+  const existingTarget = normalizeTarget({
+    id: 'fleet-a',
+    name: 'Fleet A',
+    scope: 'repo',
+    owner: 'octo',
+    repo: 'web',
+    accessToken: 'target-token',
+    labels: 'self-hosted',
+  });
+
+  const { server, baseUrl } = await startTestServer([existingTarget], {
+    saveTargetsFn,
+    ensureRunnersForTargetFn,
+    stopRunnersForTargetFn,
+    listRunJobsFn,
+    rerunWorkflowRunFn,
+    rerunFailedJobsFn,
+    rerunJobFn,
+    githubOwnerSuggestionsFn,
+    githubRepoSuggestionsFn,
+    getStatusFn,
+  });
+
+  try {
+    let result = await requestJson(baseUrl, '/api/targets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: 'repo', owner: '', repo: '', labels: '' }),
+    });
+    assert.equal(result.response.status, 400);
+
+    result = await requestJson(baseUrl, '/api/targets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Fleet A',
+        scope: 'repo',
+        owner: 'octo',
+        repo: 'web',
+        accessToken: 'target-token',
+        labels: 'self-hosted',
+      }),
+    });
+    assert.equal(result.response.status, 409);
+
+    result = await requestJson(baseUrl, '/api/targets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Fleet B',
+        scope: 'org',
+        owner: 'octo',
+        accessToken: 'second-token',
+        labels: 'self-hosted',
+      }),
+    });
+    assert.equal(result.response.status, 201);
+    assert.equal(result.body.id, 'fleet-b');
+
+    result = await requestJson(baseUrl, '/api/targets/missing', { method: 'DELETE' });
+    assert.equal(result.response.status, 404);
+
+    result = await requestJson(baseUrl, '/api/targets/missing/restart', { method: 'POST' });
+    assert.equal(result.response.status, 404);
+
+    result = await requestJson(baseUrl, '/api/targets/missing/launch', { method: 'POST' });
+    assert.equal(result.response.status, 404);
+
+    result = await requestJson(baseUrl, '/api/targets/missing/runs/44/jobs');
+    assert.equal(result.response.status, 404);
+
+    result = await requestJson(baseUrl, '/api/targets/missing/runs/44/rerun', { method: 'POST' });
+    assert.equal(result.response.status, 404);
+
+    result = await requestJson(baseUrl, '/api/targets/missing/runs/44/rerun-failed', { method: 'POST' });
+    assert.equal(result.response.status, 404);
+
+    result = await requestJson(baseUrl, '/api/targets/missing/jobs/77/rerun', { method: 'POST' });
+    assert.equal(result.response.status, 404);
+
+    result = await requestJson(baseUrl, '/api/targets/fleet-a/restart', { method: 'POST' });
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body, [{ action: 'launched', targetId: 'fleet-a' }]);
+
+    result = await requestJson(baseUrl, '/api/targets/fleet-a/launch', { method: 'POST' });
+    assert.equal(result.response.status, 200);
+
+    result = await requestJson(baseUrl, '/api/targets/fleet-a/runs/44/jobs');
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body, [{ id: 44, name: 'lint' }]);
+
+    result = await requestJson(baseUrl, '/api/targets/fleet-a/runs/44/rerun', { method: 'POST' });
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body, { runId: '44', rerun: true });
+
+    result = await requestJson(baseUrl, '/api/targets/fleet-a/runs/44/rerun-failed', { method: 'POST' });
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body, { runId: '44', failed: true });
+
+    result = await requestJson(baseUrl, '/api/targets/fleet-a/jobs/77/rerun', { method: 'POST' });
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body, { jobId: '77', rerun: true });
+
+    result = await requestJson(baseUrl, '/api/github/owners?targetId=fleet-a&q=oct');
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body, ['target-token:oct']);
+
+    result = await requestJson(baseUrl, '/api/github/repos');
+    assert.equal(result.response.status, 400);
+
+    result = await requestJson(baseUrl, '/api/github/repos?targetId=fleet-a&owner=octo&q=we');
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body, ['target-token:octo:we']);
+
+    result = await requestJson(baseUrl, '/api/status');
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body, {
+      generatedAt: 'now',
+      targets: [{ id: 'fleet-a' }, { id: 'fleet-b' }],
+    });
+
+    result = await requestJson(baseUrl, '/api/targets/fleet-a', { method: 'DELETE' });
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body, { removed: 'fleet-a' });
+
+    const notFound = await requestJson(baseUrl, '/api/unknown');
+    assert.equal(notFound.response.status, 404);
+    assert.deepEqual(notFound.body, { error: 'Not found' });
+
+    const favicon = await fetch(`${baseUrl}/favicon.ico`);
+    assert.equal(favicon.status, 204);
+
+    const appShell = await fetch(`${baseUrl}/dashboard`);
+    assert.equal(appShell.status, 200);
+  } finally {
+    server.close();
+    await once(server, 'close');
+  }
+});
+
+test('createServer surfaces async route failures as 500 json responses', async () => {
+  const { server, baseUrl } = await startTestServer([], {
+    githubOwnerSuggestionsFn: async () => {
+      throw new Error('owners failed');
+    },
+    getStatusFn: async () => {
+      throw new Error('status failed');
+    },
+  });
+
+  try {
+    let result = await requestJson(baseUrl, '/api/github/owners');
+    assert.equal(result.response.status, 500);
+    assert.deepEqual(result.body, { error: 'owners failed' });
+
+    result = await requestJson(baseUrl, '/api/status');
+    assert.equal(result.response.status, 500);
+    assert.deepEqual(result.body, { error: 'status failed' });
+  } finally {
+    server.close();
+    await once(server, 'close');
+  }
 });

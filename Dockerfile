@@ -12,7 +12,7 @@ WORKDIR /app
 ENV NODE_ENV=production
 
 COPY --from=build /app/package.json ./package.json
-COPY --from=build /app/status-app ./status-app
 COPY --from=build /app/frontend/dist ./frontend/dist
+COPY --from=build /app/dist-server ./dist-server
 
-CMD ["node", "status-app/server.js"]
+CMD ["node", "dist-server/status-app/server.js"]
