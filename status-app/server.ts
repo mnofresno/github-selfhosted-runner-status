@@ -307,11 +307,21 @@ function saveTargets(targets) {
   fs.writeFileSync(TARGETS_FILE, JSON.stringify(targets, null, 2), 'utf8');
 }
 
+function deriveTargetBaseName(scope, owner, repo) {
+  const ownerName = String(owner || '').trim();
+  const repoName = String(repo || '').trim();
+  if (scope === 'repo' && ownerName && repoName) {
+    return `${ownerName}/${repoName}`;
+  }
+  return ownerName || repoName || '';
+}
+
 function normalizeTarget(input, env = process.env) {
   const scope = String(input.scope || 'org').toLowerCase();
-  const id = slugify(input.id || input.name || `target-${Date.now()}`);
   const owner = input.owner || input.org || '';
   const repo = input.repo || '';
+  const derivedName = deriveTargetBaseName(scope, owner, repo);
+  const id = slugify(input.id || input.name || derivedName || `target-${Date.now()}`);
   const token = input.accessToken || env.ACCESS_TOKEN || '';
   const labels = parseLabels(input.labels || env.LABELS || 'self-hosted,linux,x64');
   const runnersCount = Math.max(1, Number.parseInt(input.runnersCount || input.runners || DEFAULT_RUNNERS_PER_TARGET, 10) || 1);
@@ -324,7 +334,7 @@ function normalizeTarget(input, env = process.env) {
   if (scope === 'repo' && !repo) throw new Error(`Target "${id}" requires repo for repo scope`);
 
   return {
-    id, name: input.name || id, scope, owner, repo, accessToken: token,
+    id, name: input.name || derivedName || id, scope, owner, repo, accessToken: token,
     labels, runnersCount, runnerImage: image, runnerWorkdir: workdir,
     dindImage, runnerGroup: input.runnerGroup || '',
     description: input.description || '',
@@ -378,6 +388,13 @@ function normalizeAutocompleteItems(items, query = '') {
     .sort((a, b) => a.localeCompare(b));
 }
 
+function normalizeAccessibleOwners(user, orgs) {
+  return normalizeAutocompleteItems([
+    user?.login,
+    ...(Array.isArray(orgs) ? orgs.map((org) => org.login) : []),
+  ]);
+}
+
 function resolveAutocompleteToken(targets, requestedTargetId, env = process.env) {
   if (requestedTargetId) {
     const matched = targets.find((target) => target.id === requestedTargetId);
@@ -391,12 +408,10 @@ function validateTargetFormInput(input) {
   const scope = String(input.scope || 'org').toLowerCase();
   const owner = String(input.owner || '').trim();
   const repo = String(input.repo || '').trim();
-  const name = String(input.name || '').trim();
   const labels = parseLabels(input.labels || '');
   const errors = [];
   const slugPattern = /^[A-Za-z0-9_.-]+$/;
 
-  if (!name) errors.push('Name is required.');
   if (!owner) {
     errors.push('Owner / Org is required.');
   } else if (!slugPattern.test(owner)) {
@@ -426,20 +441,12 @@ async function githubOwnerSuggestions(token, q = '') {
   const cacheKey = buildAutocompleteCacheKey('owners', token, [query]);
 
   return withAutocompleteCache(cacheKey, async () => {
-    if (query) {
-      const payload = await github(token, `/search/users?q=${encodeURIComponent(`${query} in:login`)}&per_page=20`);
-      return normalizeAutocompleteItems((payload.items || []).map((item) => item.login), query);
-    }
-
     const [user, orgs] = await Promise.all([
       github(token, '/user'),
       github(token, '/user/orgs?per_page=100'),
     ]);
 
-    return normalizeAutocompleteItems([
-      user?.login,
-      ...(Array.isArray(orgs) ? orgs.map((org) => org.login) : []),
-    ]);
+    return normalizeAutocompleteItems(normalizeAccessibleOwners(user, orgs), query);
   });
 }
 
@@ -451,20 +458,21 @@ async function githubRepoSuggestions(token, owner, q = '') {
   const cacheKey = buildAutocompleteCacheKey('repos', token, [ownerName, query]);
 
   return withAutocompleteCache(cacheKey, async () => {
-    if (query) {
-      const payload = await github(token, `/search/repositories?q=${encodeURIComponent(`${query} user:${ownerName}`)}&per_page=50`);
-      return normalizeAutocompleteItems((payload.items || []).map((item) => item.name), query);
+    const [user, orgs] = await Promise.all([
+      github(token, '/user'),
+      github(token, '/user/orgs?per_page=100'),
+    ]);
+    const accessibleOwners = normalizeAccessibleOwners(user, orgs);
+    const allowedOwners = new Set(accessibleOwners.map((item) => item.toLowerCase()));
+    if (!allowedOwners.has(ownerName.toLowerCase())) return [];
+
+    if (String(user?.login || '').toLowerCase() === ownerName.toLowerCase()) {
+      const userRepos = await github(token, '/user/repos?per_page=100&affiliation=owner');
+      return normalizeAutocompleteItems((Array.isArray(userRepos) ? userRepos : []).map((repo) => repo.name), query);
     }
 
-    try {
-      const orgRepos = await github(token, `/orgs/${encodeURIComponent(ownerName)}/repos?per_page=100`);
-      return normalizeAutocompleteItems((Array.isArray(orgRepos) ? orgRepos : []).map((repo) => repo.name));
-    } catch (error) {
-      if (!error.message.includes('404')) throw error;
-    }
-
-    const userRepos = await github(token, `/users/${encodeURIComponent(ownerName)}/repos?per_page=100`);
-    return normalizeAutocompleteItems((Array.isArray(userRepos) ? userRepos : []).map((repo) => repo.name));
+    const orgRepos = await github(token, `/orgs/${encodeURIComponent(ownerName)}/repos?per_page=100&type=all`);
+    return normalizeAutocompleteItems((Array.isArray(orgRepos) ? orgRepos : []).map((repo) => repo.name), query);
   });
 }
 /* c8 ignore stop */
@@ -944,7 +952,7 @@ if (require.main === module) {
 
 module.exports = {
   createServer, loadTargets, normalizeTarget, parseLabels, parseListenPort,
-  slugify, targetHasRepoFeed, normalizeAutocompleteItems, resolveAutocompleteToken,
+  slugify, targetHasRepoFeed, normalizeAutocompleteItems, normalizeAccessibleOwners, resolveAutocompleteToken,
   validateTargetFormInput, buildAutocompleteCacheKey, readAutocompleteCache,
   writeAutocompleteCache, withAutocompleteCache, clearAutocompleteCache,
   loadPersistedTargets, saveTargets, ensureRunnersForTarget,

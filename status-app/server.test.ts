@@ -9,6 +9,7 @@ const {
   parseListenPort,
   targetHasRepoFeed,
   normalizeAutocompleteItems,
+  normalizeAccessibleOwners,
   resolveAutocompleteToken,
   validateTargetFormInput,
   buildAutocompleteCacheKey,
@@ -133,6 +134,17 @@ test('normalizeTarget falls back to env ACCESS_TOKEN', () => {
   assert.equal(target.accessToken, 'env_tok');
 });
 
+test('normalizeTarget derives id and name from owner and repo when name is omitted', () => {
+  const target = normalizeTarget({
+    scope: 'repo',
+    owner: 'gymnerd-ar',
+    repo: 'gymnerd-bot',
+    accessToken: 'tok',
+  });
+  assert.equal(target.id, 'gymnerd-ar-gymnerd-bot');
+  assert.equal(target.name, 'gymnerd-ar/gymnerd-bot');
+});
+
 /* ── targetHasRepoFeed ──────────────────────────────────────────── */
 
 test('targetHasRepoFeed returns true with owner and repo', () => {
@@ -149,6 +161,16 @@ test('normalizeAutocompleteItems deduplicates, filters and sorts', () => {
   assert.deepEqual(
     normalizeAutocompleteItems(['zeta', 'Alpha', 'alpha', 'beta'], 'a'),
     ['Alpha', 'beta', 'zeta'],
+  );
+});
+
+test('normalizeAccessibleOwners keeps only the token user and its org memberships', () => {
+  assert.deepEqual(
+    normalizeAccessibleOwners(
+      { login: 'mnofresno' },
+      [{ login: 'gymnerd-ar' }, { login: 'bpf-project' }, { login: 'gymnerd-ar' }],
+    ),
+    ['bpf-project', 'gymnerd-ar', 'mnofresno'],
   );
 });
 
@@ -216,7 +238,6 @@ test('withAutocompleteCache only invokes loader once before ttl expiry', async (
 
 test('validateTargetFormInput accepts valid org target input', () => {
   const result = validateTargetFormInput({
-    name: 'GymNerd Org',
     scope: 'org',
     owner: 'gymnerd-ar',
     labels: 'self-hosted,linux,x64',
