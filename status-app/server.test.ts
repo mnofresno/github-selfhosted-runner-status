@@ -20,6 +20,8 @@ const {
   loadPersistedTargets,
   saveTargets,
   resolveClientDistDir,
+  sanitizeStatusForClient,
+  sanitizeTargetForClient,
 } = require('./server.ts');
 
 const fs = require('fs');
@@ -150,6 +152,37 @@ test('normalizeTarget derives id and name from owner and repo when name is omitt
   });
   assert.equal(target.id, 'gymnerd-ar-gymnerd-bot');
   assert.equal(target.name, 'gymnerd-ar/gymnerd-bot');
+});
+
+test('sanitizeTargetForClient removes accessToken and keeps public fields', () => {
+  const target = sanitizeTargetForClient({
+    id: 'fleet-a',
+    name: 'Fleet A',
+    owner: 'octo',
+    repo: 'web',
+    accessToken: 'top-secret',
+    repository: 'octo/web',
+  });
+  assert.equal(target.accessToken, undefined);
+  assert.equal(target.id, 'fleet-a');
+  assert.equal(target.repository, 'octo/web');
+});
+
+test('sanitizeStatusForClient strips access tokens from every target', () => {
+  const status = sanitizeStatusForClient({
+    generatedAt: 'now',
+    targets: [
+      { id: 'fleet-a', accessToken: 'secret-a', repository: 'octo/web' },
+      { id: 'fleet-b', accessToken: 'secret-b', repository: 'octo' },
+    ],
+  });
+  assert.deepEqual(status, {
+    generatedAt: 'now',
+    targets: [
+      { id: 'fleet-a', repository: 'octo/web' },
+      { id: 'fleet-b', repository: 'octo' },
+    ],
+  });
 });
 
 /* ── targetHasRepoFeed ──────────────────────────────────────────── */
@@ -398,6 +431,7 @@ test('createServer serves target management and GitHub helper routes', async () 
     });
     assert.equal(result.response.status, 201);
     assert.equal(result.body.id, 'fleet-b');
+    assert.equal(result.body.accessToken, undefined);
 
     result = await requestJson(baseUrl, '/api/targets/missing', { method: 'DELETE' });
     assert.equal(result.response.status, 404);
@@ -460,6 +494,8 @@ test('createServer serves target management and GitHub helper routes', async () 
       generatedAt: 'now',
       targets: [{ id: 'fleet-a' }, { id: 'fleet-b' }],
     });
+    assert.equal(JSON.stringify(result.body).includes('target-token'), false);
+    assert.equal(JSON.stringify(result.body).includes('second-token'), false);
 
     result = await requestJson(baseUrl, '/api/targets/fleet-a', { method: 'DELETE' });
     assert.equal(result.response.status, 200);

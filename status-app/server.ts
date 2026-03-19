@@ -349,6 +349,20 @@ function normalizeTarget(input, env = process.env) {
   };
 }
 
+function sanitizeTargetForClient(target) {
+  const { accessToken: _accessToken, ...safeTarget } = target;
+  return safeTarget;
+}
+
+function sanitizeStatusForClient(status) {
+  return {
+    ...status,
+    targets: Array.isArray(status?.targets)
+      ? status.targets.map(sanitizeTargetForClient)
+      : [],
+  };
+}
+
 /* c8 ignore start */
 function loadTargets(env = process.env) {
   const persisted = loadPersistedTargets();
@@ -798,7 +812,7 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
     targets.push(target);
     saveTargetsFn(targets);
     ensureRunnersForTargetFn(target).catch((error) => console.error('[fleet] launch error:', error.message));
-    res.status(201).json(target);
+    res.status(201).json(sanitizeTargetForClient(target));
   }));
 
   app.delete('/api/targets/:targetId', asyncRoute(async (req, res) => {
@@ -896,7 +910,7 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
   }));
 
   app.get('/api/status', asyncRoute(async (_req, res) => {
-    res.json(await getStatusFn(targets));
+    res.json(sanitizeStatusForClient(await getStatusFn(targets)));
   }));
 
   app.use('/api', (_req, res) => {
@@ -973,4 +987,5 @@ module.exports = {
   validateTargetFormInput, buildAutocompleteCacheKey, readAutocompleteCache,
   writeAutocompleteCache, withAutocompleteCache, clearAutocompleteCache,
   loadPersistedTargets, saveTargets, ensureRunnersForTarget, resolveClientDistDir,
+  sanitizeStatusForClient, sanitizeTargetForClient,
 };
