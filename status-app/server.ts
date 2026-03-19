@@ -746,6 +746,10 @@ function asyncRoute(handler) {
   return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 }
 
+function renderClientShellFallback() {
+  return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>GitHub Runner Fleet</title></head><body><div id="root"></div></body></html>';
+}
+
 function createServer(initialTargets, options: CreateServerOptions = {}) {
   const app = express();
   let targets = [...initialTargets];
@@ -902,7 +906,12 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
   });
 
   app.get(/.*/, (_req, res) => {
-    res.sendFile(path.join(CLIENT_DIST_DIR, 'index.html'));
+    const clientIndexPath = path.join(CLIENT_DIST_DIR, 'index.html');
+    if (!fs.existsSync(clientIndexPath)) {
+      res.status(200).type('html').send(renderClientShellFallback());
+      return;
+    }
+    res.sendFile(clientIndexPath);
   });
 
   app.use((error, _req, res, _next) => {
