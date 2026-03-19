@@ -1,43 +1,57 @@
 # GitHub Runner Fleet
 
-Self-hosted GitHub Actions runner manager with **persistent runners** and a web-based dashboard.
+Self-hosted GitHub Actions runner manager with a React + TypeScript dashboard and an Express backend written in TypeScript.
 
 ## Architecture
 
-```
+```text
 ┌──────────────────────────────────┐
-│  runner-status (Node.js)         │
-│  ┌────────────┐ ┌─────────────┐  │
-│  │ Dashboard   │ │ CRUD API    │  │
-│  │ (HTML/JS)   │ │ /api/...    │  │
-│  └────────────┘ └─────────────┘  │
-│           │                      │
+│ runner-status (Node.js)          │
+│ ┌──────────────┐ ┌─────────────┐ │
+│ │ React SPA    │ │ CRUD API    │ │
+│ │ (compiled)   │ │ /api/...    │ │
+│ └──────────────┘ └─────────────┘ │
+│          │                       │
 │     Docker Socket                │
-│           │                      │
-│  ┌────────▼────────────────────┐ │
-│  │ Persistent Runner Stacks    │ │
-│  │ ┌─────────┐ ┌────────────┐ │ │
-│  │ │ Runner  │ │ DinD       │ │ │
-│  │ │ (always │ │ (always    │ │ │
-│  │ │  on)    │ │  on)       │ │ │
-│  │ └─────────┘ └────────────┘ │ │
-│  └─────────────────────────────┘ │
+│          │                       │
+│ ┌────────▼─────────────────────┐ │
+│ │ Persistent Runner Stacks     │ │
+│ │ ┌─────────┐ ┌─────────────┐ │ │
+│ │ │ Runner  │ │ DinD        │ │ │
+│ │ │ (always │ │ (always     │ │ │
+│ │ │  on)    │ │  on)        │ │ │
+│ │ └─────────┘ └─────────────┘ │ │
+│ └─────────────────────────────┘ │
 └──────────────────────────────────┘
 ```
 
-**Runners are persistent** — they stay running and connected to GitHub at all times. When a workflow job arrives, the runner agent executes it inside the DinD daemon. No waiting for runner spin-up.
+Runners are persistent. They stay connected to GitHub all the time, and the UI is now a compiled client app instead of inline HTML rendered from the backend.
 
-**Configuration is done via the web UI** — add, remove, or restart targets from the dashboard. Config is persisted to `/app/data/targets.json`.
+## Files
+
+- `frontend/`: React + TypeScript dashboard source
+- `status-app/server.ts`: Docker orchestration, GitHub API integration, Express routes, and static asset serving
+- `status-app/cleanup.ts`: cleanup logic for stale managed resources
+- `docker-compose.yml`: production-oriented container setup
+- `Dockerfile`: multi-stage image build for the frontend bundle and compiled backend runtime
 
 ## Quick Start
 
 ```bash
 cp .env.example .env
-# Edit .env — set ACCESS_TOKEN and configure RUNNER_TARGETS_JSON
-docker compose up -d
+# edit .env and set ACCESS_TOKEN / RUNNER_TARGETS_JSON
+npm ci
+npm run build
+npm start
 ```
 
-Visit `http://localhost:3571` to see the dashboard.
+For the same path used in production:
+
+```bash
+docker compose up -d --build
+```
+
+Visit `http://localhost:3571`.
 
 ## Configuration
 
@@ -45,7 +59,7 @@ Visit `http://localhost:3571` to see the dashboard.
 
 | Variable | Default | Description |
 |---|---|---|
-| `ACCESS_TOKEN` | — | GitHub PAT with `admin:org` scope |
+| `ACCESS_TOKEN` | — | GitHub PAT with runner administration access |
 | `RUNNER_IMAGE` | `myoung34/github-runner:latest` | Docker image for runners |
 | `DIND_IMAGE` | `docker:27-dind` | Docker-in-Docker image |
 | `RUNNERS_PER_TARGET` | `1` | Default runner count per target |
@@ -57,10 +71,11 @@ Visit `http://localhost:3571` to see the dashboard.
 
 Targets can be configured two ways:
 
-1. **Via UI** — Use the "Add Target" form in the dashboard
-2. **Via `RUNNER_TARGETS_JSON`** — JSON array in `.env` (imported on first startup)
+1. Via UI in the dashboard.
+2. Via `RUNNER_TARGETS_JSON` in `.env` and imported on first startup.
 
 Example target:
+
 ```json
 {
   "id": "my-org",
@@ -79,7 +94,7 @@ Example target:
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/` | Dashboard UI |
+| `GET` | `/` | React dashboard |
 | `GET` | `/api/status` | Full fleet status JSON |
 | `POST` | `/api/targets` | Add a new target |
 | `DELETE` | `/api/targets/:id` | Remove a target and stop its runners |
@@ -89,10 +104,8 @@ Example target:
 | `POST` | `/api/targets/:id/runs/:runId/rerun-failed` | Retry failed jobs |
 | `POST` | `/api/targets/:id/jobs/:jobId/rerun` | Rerun a single job |
 
-## How It Works
+## CI/CD
 
-1. On startup, targets are loaded from `targets.json` (or imported from `RUNNER_TARGETS_JSON` on first run)
-2. For each target, persistent runner+DinD container pairs are created and started
-3. A healthcheck loop runs every 15s to restart any crashed runners
-4. The dashboard shows real-time status from Docker and GitHub APIs
-5. Targets can be added/removed from the dashboard — changes persist across restarts
+- `CI` runs `npm ci`, `npm run typecheck`, `npm test`, and `npm run build`.
+- `Deploy` runs the same verification on pushes to `main` and then triggers the existing production auto-deploy.
+- Production now builds the frontend bundle into the container image and serves it from the Node runtime.

@@ -1,6 +1,8 @@
 services:
   runner-status:
-    image: node:20-alpine
+    build:
+      context: .
+    image: github-runner-fleet:latest
     restart: unless-stopped
     env_file:
       - .env
@@ -8,12 +10,10 @@ services:
       STATUS_PORT: ${STATUS_INTERNAL_PORT:-8080}
       HEALTHCHECK_INTERVAL_MS: ${HEALTHCHECK_INTERVAL_MS:-15000}
       DATA_DIR: /app/data
-    command: ["node", "/app/server.js"]
     ports:
       - "${STATUS_BIND:-127.0.0.1:3571}:${STATUS_INTERNAL_PORT:-8080}"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./status-app:/app:ro
       - runner-fleet-data:/app/data
 
 volumes:
