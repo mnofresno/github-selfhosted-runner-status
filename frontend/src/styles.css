@@ -284,12 +284,14 @@ button.accent {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
+  align-items: start;
 }
 
 .form-field {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  min-width: 0;
 }
 
 .form-field label {
@@ -301,11 +303,13 @@ button.accent {
 .form-field input,
 .form-field select {
   width: 100%;
-  min-height: 42px;
+  min-height: 44px;
   padding: 8px 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface);
+  line-height: 1.2;
+  appearance: none;
 }
 
 .form-field input:disabled {
@@ -315,8 +319,9 @@ button.accent {
 
 .field-note,
 .field-error {
-  min-height: 18px;
+  min-height: 32px;
   font-size: 12px;
+  line-height: 1.35;
 }
 
 .field-note {
@@ -331,6 +336,12 @@ button.accent {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
+  align-items: start;
+}
+
+.input-with-button button {
+  min-height: 44px;
+  white-space: nowrap;
 }
 
 .input-invalid {
@@ -343,7 +354,7 @@ button.accent {
 }
 
 .form-actions {
-  align-items: flex-end;
+  align-items: flex-start;
 }
 
 @media (max-width: 1024px) {
