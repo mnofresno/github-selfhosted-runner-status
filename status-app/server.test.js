@@ -7,6 +7,9 @@ const {
   parseLabels,
   parseListenPort,
   targetHasRepoFeed,
+  normalizeAutocompleteItems,
+  resolveAutocompleteToken,
+  validateTargetFormInput,
   loadPersistedTargets,
   saveTargets,
 } = require('./server');
@@ -108,6 +111,75 @@ test('targetHasRepoFeed returns true with owner and repo', () => {
 
 test('targetHasRepoFeed returns false without repo', () => {
   assert.equal(targetHasRepoFeed({ owner: 'a', repo: '' }), false);
+});
+
+/* ── Autocomplete helpers ────────────────────────────────────────── */
+
+test('normalizeAutocompleteItems deduplicates, filters and sorts', () => {
+  assert.deepEqual(
+    normalizeAutocompleteItems(['zeta', 'Alpha', 'alpha', 'beta'], 'a'),
+    ['Alpha', 'beta', 'zeta'],
+  );
+});
+
+test('resolveAutocompleteToken prefers target token when targetId is provided', () => {
+  const token = resolveAutocompleteToken([
+    { id: 'one', accessToken: 'tok_one' },
+    { id: 'two', accessToken: 'tok_two' },
+  ], 'two', { ACCESS_TOKEN: 'env_tok' });
+  assert.equal(token, 'tok_two');
+});
+
+test('resolveAutocompleteToken falls back to env ACCESS_TOKEN', () => {
+  const token = resolveAutocompleteToken([{ id: 'one', accessToken: 'tok_one' }], '', { ACCESS_TOKEN: 'env_tok' });
+  assert.equal(token, 'env_tok');
+});
+
+/* ── Form validation ─────────────────────────────────────────────── */
+
+test('validateTargetFormInput accepts valid org target input', () => {
+  const result = validateTargetFormInput({
+    name: 'GymNerd Org',
+    scope: 'org',
+    owner: 'gymnerd-ar',
+    labels: 'self-hosted,linux,x64',
+  });
+  assert.equal(result.valid, true);
+  assert.deepEqual(result.errors, []);
+});
+
+test('validateTargetFormInput requires repo for repo scope', () => {
+  const result = validateTargetFormInput({
+    name: 'GymNerd Repo',
+    scope: 'repo',
+    owner: 'gymnerd-ar',
+    repo: '',
+    labels: 'self-hosted',
+  });
+  assert.equal(result.valid, false);
+  assert.match(result.errors.join(' '), /Repository is required/);
+});
+
+test('validateTargetFormInput rejects invalid owner slug', () => {
+  const result = validateTargetFormInput({
+    name: 'Bad Owner',
+    scope: 'org',
+    owner: 'gymnerd ar',
+    labels: 'self-hosted',
+  });
+  assert.equal(result.valid, false);
+  assert.match(result.errors.join(' '), /Owner \/ Org can only contain/);
+});
+
+test('validateTargetFormInput requires at least one label', () => {
+  const result = validateTargetFormInput({
+    name: 'No Labels',
+    scope: 'org',
+    owner: 'gymnerd-ar',
+    labels: '',
+  });
+  assert.equal(result.valid, false);
+  assert.match(result.errors.join(' '), /At least one label is required/);
 });
 
 /* ── Target Persistence ─────────────────────────────────────────── */
