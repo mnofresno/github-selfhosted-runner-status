@@ -2,6 +2,7 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { URL } = require('url');
 
 const DEFAULT_PORT = 8080;
@@ -12,6 +13,8 @@ const DEFAULT_RUNNER_IMAGE = process.env.RUNNER_IMAGE || 'myoung34/github-runner
 const HEALTHCHECK_INTERVAL_MS = Number.parseInt(process.env.HEALTHCHECK_INTERVAL_MS || '15000', 10);
 const DATA_DIR = process.env.DATA_DIR || '/app/data';
 const TARGETS_FILE = path.join(DATA_DIR, 'targets.json');
+const AUTOCOMPLETE_CACHE_TTL_MS = Number.parseInt(process.env.AUTOCOMPLETE_CACHE_TTL_MS || '60000', 10);
+const AUTOCOMPLETE_CACHE_MAX_ENTRIES = Math.max(20, Number.parseInt(process.env.AUTOCOMPLETE_CACHE_MAX_ENTRIES || '200', 10));
 
 const MANAGED_LABEL = 'io.github-runner-fleet.managed';
 const MANAGED_TARGET_LABEL = 'io.github-runner-fleet.target-id';
@@ -87,6 +90,51 @@ function parseListenPort(value) {
 }
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+/* ── Small In-Memory Cache ─────────────────────────────────────────── */
+
+const autocompleteCache = new Map();
+
+function hashToken(value) {
+  return crypto.createHash('sha1').update(String(value || '')).digest('hex');
+}
+
+function buildAutocompleteCacheKey(scope, token, parts = []) {
+  return [scope, hashToken(token), ...parts.map((part) => String(part || '').trim().toLowerCase())].join('::');
+}
+
+function readAutocompleteCache(key, now = Date.now()) {
+  const entry = autocompleteCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= now) {
+    autocompleteCache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function writeAutocompleteCache(key, value, ttlMs = AUTOCOMPLETE_CACHE_TTL_MS, now = Date.now()) {
+  if (autocompleteCache.size >= AUTOCOMPLETE_CACHE_MAX_ENTRIES) {
+    const oldestKey = autocompleteCache.keys().next().value;
+    if (oldestKey) autocompleteCache.delete(oldestKey);
+  }
+  autocompleteCache.set(key, {
+    value,
+    expiresAt: now + Math.max(1000, ttlMs),
+  });
+  return value;
+}
+
+function clearAutocompleteCache() {
+  autocompleteCache.clear();
+}
+
+async function withAutocompleteCache(key, loader, ttlMs = AUTOCOMPLETE_CACHE_TTL_MS, now = Date.now()) {
+  const cached = readAutocompleteCache(key, now);
+  if (cached) return cached;
+  const value = await loader();
+  return writeAutocompleteCache(key, value, ttlMs, now);
+}
 
 /* ── GitHub API ─────────────────────────────────────────────────────── */
 
@@ -295,6 +343,110 @@ function loadTargets(env = process.env) {
 
 function targetHasRepoFeed(target) {
   return Boolean(target.owner && target.repo);
+}
+
+function normalizeAutocompleteItems(items, query = '') {
+  const needle = String(query || '').trim().toLowerCase();
+  const seen = new Set();
+  return items
+    .map((item) => String(item || '').trim())
+    .filter(Boolean)
+    .filter((item) => {
+      const key = item.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return !needle || key.includes(needle);
+    })
+    .sort((a, b) => a.localeCompare(b));
+}
+
+function resolveAutocompleteToken(targets, requestedTargetId, env = process.env) {
+  if (requestedTargetId) {
+    const matched = targets.find((target) => target.id === requestedTargetId);
+    if (matched?.accessToken) return matched.accessToken;
+  }
+  if (env.ACCESS_TOKEN) return env.ACCESS_TOKEN;
+  return targets.find((target) => target.accessToken)?.accessToken || '';
+}
+
+function validateTargetFormInput(input) {
+  const scope = String(input.scope || 'org').toLowerCase();
+  const owner = String(input.owner || '').trim();
+  const repo = String(input.repo || '').trim();
+  const name = String(input.name || '').trim();
+  const labels = parseLabels(input.labels || '');
+  const errors = [];
+  const slugPattern = /^[A-Za-z0-9_.-]+$/;
+
+  if (!name) errors.push('Name is required.');
+  if (!owner) {
+    errors.push('Owner / Org is required.');
+  } else if (!slugPattern.test(owner)) {
+    errors.push('Owner / Org can only contain letters, numbers, ".", "_" and "-".');
+  }
+
+  if (scope === 'repo' && !repo) {
+    errors.push('Repository is required when scope is repository.');
+  } else if (repo && !slugPattern.test(repo)) {
+    errors.push('Repository can only contain letters, numbers, ".", "_" and "-".');
+  }
+
+  if (!labels.length) {
+    errors.push('At least one label is required.');
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+  };
+}
+
+async function githubOwnerSuggestions(token, q = '') {
+  const query = String(q || '').trim();
+  if (!token) throw new Error('Missing ACCESS_TOKEN for owner lookup');
+  const cacheKey = buildAutocompleteCacheKey('owners', token, [query]);
+
+  return withAutocompleteCache(cacheKey, async () => {
+    if (query) {
+      const payload = await github(token, `/search/users?q=${encodeURIComponent(`${query} in:login`)}&per_page=20`);
+      return normalizeAutocompleteItems((payload.items || []).map((item) => item.login), query);
+    }
+
+    const [user, orgs] = await Promise.all([
+      github(token, '/user'),
+      github(token, '/user/orgs?per_page=100'),
+    ]);
+
+    return normalizeAutocompleteItems([
+      user?.login,
+      ...(Array.isArray(orgs) ? orgs.map((org) => org.login) : []),
+    ]);
+  });
+}
+
+async function githubRepoSuggestions(token, owner, q = '') {
+  const query = String(q || '').trim();
+  const ownerName = String(owner || '').trim();
+  if (!token) throw new Error('Missing ACCESS_TOKEN for repo lookup');
+  if (!ownerName) throw new Error('Owner / Org is required for repo lookup');
+  const cacheKey = buildAutocompleteCacheKey('repos', token, [ownerName, query]);
+
+  return withAutocompleteCache(cacheKey, async () => {
+    if (query) {
+      const payload = await github(token, `/search/repositories?q=${encodeURIComponent(`${query} user:${ownerName}`)}&per_page=50`);
+      return normalizeAutocompleteItems((payload.items || []).map((item) => item.name), query);
+    }
+
+    try {
+      const orgRepos = await github(token, `/orgs/${encodeURIComponent(ownerName)}/repos?per_page=100`);
+      return normalizeAutocompleteItems((Array.isArray(orgRepos) ? orgRepos : []).map((repo) => repo.name));
+    } catch (error) {
+      if (!error.message.includes('404')) throw error;
+    }
+
+    const userRepos = await github(token, `/users/${encodeURIComponent(ownerName)}/repos?per_page=100`);
+    return normalizeAutocompleteItems((Array.isArray(userRepos) ? userRepos : []).map((repo) => repo.name));
+  });
 }
 
 /* ── Persistent Runner Management ────────────────────────────────────── */
@@ -571,6 +723,14 @@ function renderTone(value, tone) {
   return `<span class="tone tone-${tone}">${escapeHtml(value)}</span>`;
 }
 
+function renderLookupTargetOptions(targets) {
+  const options = ['<option value="">Default ACCESS_TOKEN</option>'];
+  for (const target of targets) {
+    options.push(`<option value="${escapeHtml(target.id)}">${escapeHtml(target.name)} (${escapeHtml(target.owner)})</option>`);
+  }
+  return options.join('');
+}
+
 function renderLocalRunnerRows(target) {
   if (!target.localRunners.length) return '<tr><td colspan="4">No runners configured.</td></tr>';
   return target.localRunners.map((r) => {
@@ -663,6 +823,7 @@ function render(status) {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="refresh" content="30">
   <title>GitHub Runner Fleet</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0%25' x2='100%25' y1='0%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%23285540'/%3E%3Cstop offset='100%25' stop-color='%234a7a61'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='14' fill='url(%23g)'/%3E%3Cpath d='M17 24h18l-4 8H17zm12 11h18l-4 8H29z' fill='%23f3f4ef'/%3E%3Ccircle cx='45' cy='21' r='5' fill='%23f7d774'/%3E%3C/svg%3E">
   <style>
     :root { color-scheme: light; --bg: #f3f4ef; --surface: #ffffff; --surface-muted: #f7f7f3; --border: #d8d5cb; --text: #1f2320; --muted: #646a64; --accent: #285540; --accent-soft: #e6efe9; --warn: #9a6b16; --warn-soft: #fff2cf; --danger: #9c3d2d; --danger-soft: #fde7e3; }
     * { box-sizing: border-box; }
@@ -707,6 +868,12 @@ function render(status) {
     .form-field { display: flex; flex-direction: column; gap: 6px; }
     .form-field label { font-size: 13px; font-weight: 600; color: var(--muted); }
     .form-field input, .form-field select { padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; font: inherit; background: var(--surface); }
+    .form-field input[disabled] { background: #f0f0eb; color: #8a9088; }
+    .field-note { font-size: 12px; color: var(--muted); min-height: 18px; }
+    .field-error { min-height: 18px; font-size: 12px; color: var(--danger); }
+    .input-with-button { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+    .input-with-button button { white-space: nowrap; }
+    .input-invalid { border-color: #d9b1a8 !important; background: #fff8f7 !important; }
     .form-field.full { grid-column: 1 / -1; }
     @media (max-width: 1024px) { .overview, .summary-strip, .panel-grid, .form-grid { grid-template-columns: 1fr; } }
   </style>
@@ -733,8 +900,31 @@ function render(status) {
         <div class="form-grid">
           <div class="form-field"><label>Name</label><input name="name" required placeholder="e.g. My Org Fleet"></div>
           <div class="form-field"><label>Scope</label><select name="scope"><option value="org" selected>Organization</option><option value="repo">Repository</option></select></div>
-          <div class="form-field"><label>Owner / Org</label><input name="owner" required placeholder="e.g. my-org"></div>
-          <div class="form-field"><label>Repository (for run feed)</label><input name="repo" placeholder="e.g. my-app"></div>
+          <div class="form-field">
+            <label>Lookup Token</label>
+            <select name="lookupTargetId" id="lookup-target-id">${renderLookupTargetOptions(status.targets)}</select>
+            <div class="field-note">Uses the default token or one from an existing target to fetch suggestions.</div>
+          </div>
+          <div class="form-field">
+            <label>Owner / Org</label>
+            <div class="input-with-button">
+              <input id="owner-input" name="owner" required list="owner-suggestions" placeholder="e.g. my-org" autocomplete="off" spellcheck="false">
+              <button type="button" id="refresh-owner-suggestions">Suggest</button>
+            </div>
+            <datalist id="owner-suggestions"></datalist>
+            <div class="field-note">Start typing or fetch suggestions from GitHub owners and orgs you can access.</div>
+            <div class="field-error" id="owner-error"></div>
+          </div>
+          <div class="form-field">
+            <label>Repository (for run feed)</label>
+            <div class="input-with-button">
+              <input id="repo-input" name="repo" list="repo-suggestions" placeholder="e.g. my-app" autocomplete="off" spellcheck="false">
+              <button type="button" id="refresh-repo-suggestions">Suggest</button>
+            </div>
+            <datalist id="repo-suggestions"></datalist>
+            <div class="field-note" id="repo-note">Optional for org targets. Required for repo targets and run feeds.</div>
+            <div class="field-error" id="repo-error"></div>
+          </div>
           <div class="form-field"><label>Labels</label><input name="labels" value="self-hosted,linux,x64" placeholder="comma-separated"></div>
           <div class="form-field"><label>Runners Count</label><input name="runnersCount" type="number" value="1" min="1" max="5"></div>
           <div class="form-field"><label>Runner Group</label><input name="runnerGroup" placeholder="Default"></div>
@@ -750,6 +940,21 @@ function render(status) {
   </main>
   <script>
     const statusNode = document.getElementById('action-status');
+    const addTargetForm = document.getElementById('add-target-form');
+    const scopeInput = addTargetForm.elements.scope;
+    const lookupTargetInput = document.getElementById('lookup-target-id');
+    const ownerInput = document.getElementById('owner-input');
+    const repoInput = document.getElementById('repo-input');
+    const ownerSuggestions = document.getElementById('owner-suggestions');
+    const repoSuggestions = document.getElementById('repo-suggestions');
+    const ownerError = document.getElementById('owner-error');
+    const repoError = document.getElementById('repo-error');
+    const repoNote = document.getElementById('repo-note');
+    const ownerSuggestButton = document.getElementById('refresh-owner-suggestions');
+    const repoSuggestButton = document.getElementById('refresh-repo-suggestions');
+    const slugPattern = /^[A-Za-z0-9_.-]+$/;
+    const suggestionTimers = {};
+
     function setBusy(d) { document.querySelectorAll('button[data-action],button[type=submit]').forEach((b) => { b.disabled = d; }); }
 
     async function callJson(url, options = {}) {
@@ -759,8 +964,180 @@ function render(status) {
       return p;
     }
 
-    document.getElementById('add-target-form').addEventListener('submit', async (e) => {
+    function setFieldError(input, node, message) {
+      node.textContent = message || '';
+      input.classList.toggle('input-invalid', Boolean(message));
+    }
+
+    function fillSuggestionList(node, items) {
+      node.innerHTML = items.map((item) => '<option value="' + item.replace(/"/g, '&quot;') + '"></option>').join('');
+    }
+
+    function buildQuery(path, params) {
+      const search = new URLSearchParams();
+      Object.entries(params).forEach(([key, value]) => {
+        if (value) search.set(key, value);
+      });
+      const query = search.toString();
+      return query ? path + '?' + query : path;
+    }
+
+    async function loadOwnerSuggestions(query = '') {
+      const owners = await callJson(buildQuery('/api/github/owners', {
+        q: query.trim(),
+        targetId: lookupTargetInput.value,
+      }));
+      fillSuggestionList(ownerSuggestions, owners);
+      return owners;
+    }
+
+    async function loadRepoSuggestions(query = '') {
+      const owner = ownerInput.value.trim();
+      if (!owner) {
+        fillSuggestionList(repoSuggestions, []);
+        return [];
+      }
+      const repos = await callJson(buildQuery('/api/github/repos', {
+        owner,
+        q: query.trim(),
+        targetId: lookupTargetInput.value,
+      }));
+      fillSuggestionList(repoSuggestions, repos);
+      return repos;
+    }
+
+    function scheduleSuggestions(key, loader, value) {
+      clearTimeout(suggestionTimers[key]);
+      suggestionTimers[key] = setTimeout(async () => {
+        try {
+          await loader(value);
+          if (statusNode.textContent.startsWith('Autocomplete failed:')) statusNode.textContent = '';
+        } catch (err) {
+          statusNode.textContent = 'Autocomplete failed: ' + err.message;
+        }
+      }, 180);
+    }
+
+    function updateRepoAvailability() {
+      const repoRequired = scopeInput.value === 'repo';
+      repoInput.disabled = !repoRequired;
+      repoInput.required = repoRequired;
+      if (!repoRequired) {
+        repoInput.value = '';
+        fillSuggestionList(repoSuggestions, []);
+        setFieldError(repoInput, repoError, '');
+      }
+      repoNote.textContent = repoRequired
+        ? 'Required for repository targets. Suggestions depend on the selected owner.'
+        : 'Optional for org targets. Add one if you want a run feed on the dashboard.';
+    }
+
+    function validateTargetField(input, node, options = {}) {
+      const value = input.value.trim();
+      if (!value) {
+        if (options.required) {
+          setFieldError(input, node, options.requiredMessage || 'This field is required.');
+          return false;
+        }
+        setFieldError(input, node, '');
+        return true;
+      }
+      if (!slugPattern.test(value)) {
+        setFieldError(input, node, options.invalidMessage || 'Only letters, numbers, ".", "_" and "-" are allowed.');
+        return false;
+      }
+      setFieldError(input, node, '');
+      return true;
+    }
+
+    scopeInput.addEventListener('change', updateRepoAvailability);
+    lookupTargetInput.addEventListener('change', () => {
+      fillSuggestionList(ownerSuggestions, []);
+      fillSuggestionList(repoSuggestions, []);
+      if (ownerInput.value.trim()) scheduleSuggestions('owner', loadOwnerSuggestions, ownerInput.value);
+      if (repoInput.value.trim() && !repoInput.disabled) scheduleSuggestions('repo', loadRepoSuggestions, repoInput.value);
+    });
+
+    ownerInput.addEventListener('focus', () => scheduleSuggestions('owner', loadOwnerSuggestions, ownerInput.value));
+    ownerInput.addEventListener('input', () => {
+      validateTargetField(ownerInput, ownerError, {
+        required: true,
+        requiredMessage: 'Owner / Org is required.',
+        invalidMessage: 'Owner / Org can only contain letters, numbers, ".", "_" and "-".',
+      });
+      fillSuggestionList(repoSuggestions, []);
+      if (!repoInput.disabled) scheduleSuggestions('repo', loadRepoSuggestions, '');
+      scheduleSuggestions('owner', loadOwnerSuggestions, ownerInput.value);
+    });
+    ownerInput.addEventListener('blur', () => {
+      validateTargetField(ownerInput, ownerError, {
+        required: true,
+        requiredMessage: 'Owner / Org is required.',
+        invalidMessage: 'Owner / Org can only contain letters, numbers, ".", "_" and "-".',
+      });
+    });
+
+    repoInput.addEventListener('focus', () => {
+      if (!repoInput.disabled) scheduleSuggestions('repo', loadRepoSuggestions, repoInput.value);
+    });
+    repoInput.addEventListener('input', () => {
+      if (!repoInput.disabled) {
+        validateTargetField(repoInput, repoError, {
+          required: true,
+          requiredMessage: 'Repository is required for repo targets.',
+          invalidMessage: 'Repository can only contain letters, numbers, ".", "_" and "-".',
+        });
+        scheduleSuggestions('repo', loadRepoSuggestions, repoInput.value);
+      }
+    });
+    repoInput.addEventListener('blur', () => {
+      if (!repoInput.disabled) {
+        validateTargetField(repoInput, repoError, {
+          required: true,
+          requiredMessage: 'Repository is required for repo targets.',
+          invalidMessage: 'Repository can only contain letters, numbers, ".", "_" and "-".',
+        });
+      }
+    });
+
+    ownerSuggestButton.addEventListener('click', async () => {
+      try {
+        statusNode.textContent = 'Loading owner suggestions...';
+        await loadOwnerSuggestions(ownerInput.value);
+        statusNode.textContent = 'Owner suggestions updated.';
+      } catch (err) {
+        statusNode.textContent = 'Autocomplete failed: ' + err.message;
+      }
+    });
+
+    repoSuggestButton.addEventListener('click', async () => {
+      try {
+        statusNode.textContent = 'Loading repository suggestions...';
+        await loadRepoSuggestions(repoInput.value);
+        statusNode.textContent = 'Repository suggestions updated.';
+      } catch (err) {
+        statusNode.textContent = 'Autocomplete failed: ' + err.message;
+      }
+    });
+
+    updateRepoAvailability();
+
+    addTargetForm.addEventListener('submit', async (e) => {
       e.preventDefault();
+      const ownerValid = validateTargetField(ownerInput, ownerError, {
+        required: true,
+        requiredMessage: 'Owner / Org is required.',
+        invalidMessage: 'Owner / Org can only contain letters, numbers, ".", "_" and "-".',
+      });
+      const repoValid = repoInput.disabled || validateTargetField(repoInput, repoError, {
+        required: true,
+        requiredMessage: 'Repository is required for repo targets.',
+        invalidMessage: 'Repository can only contain letters, numbers, ".", "_" and "-".',
+      });
+      if (!ownerValid || !repoValid) {
+        statusNode.textContent = 'Fix the highlighted fields before adding the target.';
+        return;
+      }
       setBusy(true);
       statusNode.textContent = 'Adding target...';
       try {
@@ -863,6 +1240,11 @@ function createServer(initialTargets, _options = {}) {
       /* ── CRUD for targets ── */
       if (url.pathname === '/api/targets' && req.method === 'POST') {
         const input = JSON.parse(body);
+        const validation = validateTargetFormInput(input);
+        if (!validation.valid) {
+          sendJson(res, 400, { error: validation.errors.join(' ') });
+          return;
+        }
         input.accessToken = input.accessToken || process.env.ACCESS_TOKEN;
         const target = normalizeTarget(input);
         if (targets.find((t) => t.id === target.id)) {
@@ -938,6 +1320,25 @@ function createServer(initialTargets, _options = {}) {
         return;
       }
 
+      if (url.pathname === '/api/github/owners' && req.method === 'GET') {
+        const token = resolveAutocompleteToken(targets, url.searchParams.get('targetId'));
+        const owners = await githubOwnerSuggestions(token, url.searchParams.get('q'));
+        sendJson(res, 200, owners);
+        return;
+      }
+
+      if (url.pathname === '/api/github/repos' && req.method === 'GET') {
+        const owner = String(url.searchParams.get('owner') || '').trim();
+        if (!owner) {
+          sendJson(res, 400, { error: 'Owner / Org is required.' });
+          return;
+        }
+        const token = resolveAutocompleteToken(targets, url.searchParams.get('targetId'));
+        const repos = await githubRepoSuggestions(token, owner, url.searchParams.get('q'));
+        sendJson(res, 200, repos);
+        return;
+      }
+
       /* ── Dashboard / Status ── */
       if (url.pathname === '/api/status') {
         sendJson(res, 200, await getStatus(targets));
@@ -990,5 +1391,8 @@ if (require.main === module) {
 
 module.exports = {
   createServer, loadTargets, normalizeTarget, parseLabels, parseListenPort,
-  slugify, targetHasRepoFeed, loadPersistedTargets, saveTargets, ensureRunnersForTarget,
+  slugify, targetHasRepoFeed, normalizeAutocompleteItems, resolveAutocompleteToken,
+  validateTargetFormInput, buildAutocompleteCacheKey, readAutocompleteCache,
+  writeAutocompleteCache, withAutocompleteCache, clearAutocompleteCache,
+  loadPersistedTargets, saveTargets, ensureRunnersForTarget,
 };
