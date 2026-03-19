@@ -77,15 +77,20 @@ describe('App', () => {
 
     expect(screen.getByText('Loading fleet status...')).toBeInTheDocument();
 
-    await screen.findByRole('heading', { name: 'Fleet A' });
+    await screen.findByRole('heading', { name: 'Fleet overview' });
     expect(screen.getAllByText('octo/web').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('1/2').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('build: success').length).toBeGreaterThan(0);
+    expect(screen.getByRole('button', { name: 'Fleet A' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Add target' })).toBeInTheDocument();
     expect(api.getStatus).toHaveBeenCalled();
   });
 
   it('submits a new target and refreshes the dashboard', async () => {
     const user = userEvent.setup();
     render(<App />);
+    await screen.findByRole('heading', { name: 'Fleet overview' });
+
+    await user.click(screen.getByRole('button', { name: 'Add target' }));
     await screen.findByRole('heading', { name: 'Add Target' });
 
     await user.type(screen.getByLabelText('Name'), 'New Fleet');
@@ -105,6 +110,9 @@ describe('App', () => {
   it('shows jobs and lets a job rerun be requested', async () => {
     const user = userEvent.setup();
     render(<App />);
+    await screen.findByRole('heading', { name: 'Fleet overview' });
+
+    await user.click(screen.getByRole('button', { name: 'Fleet A' }));
     await screen.findByRole('heading', { name: 'Fleet A' });
 
     await user.click(screen.getByRole('button', { name: 'Jobs' }));
@@ -118,6 +126,9 @@ describe('App', () => {
   it('restarts and removes a target', async () => {
     const user = userEvent.setup();
     render(<App />);
+    await screen.findByRole('heading', { name: 'Fleet overview' });
+
+    await user.click(screen.getByRole('button', { name: 'Fleet A' }));
     await screen.findByRole('heading', { name: 'Fleet A' });
 
     const buttons = screen.getAllByRole('button', { name: 'Restart runners' });
