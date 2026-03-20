@@ -6,6 +6,7 @@ import { api } from '../lib/api';
 
 vi.mock('../lib/api', () => ({
   api: {
+    cancelRun: vi.fn(),
     getJobs: vi.fn(),
     removeTarget: vi.fn(),
     restartTarget: vi.fn(),
@@ -25,10 +26,13 @@ const baseTarget = {
   labels: ['self-hosted'],
   runnersCount: 1,
   description: '',
-  localRunners: [{ name: 'runner-1', state: 'running', status: 'Up', image: 'runner' }],
+  localRunners: [{ name: 'runner-1', state: 'running', status: 'Up', image: 'runner', cpuPercent: 12.5, memoryBytes: 128 * 1024 * 1024, diskBytes: 3 * 1024 * 1024 * 1024 }],
   githubRunners: [{ id: 1, name: 'gh-runner', status: 'online', busy: false, labels: ['linux'], os: 'linux' }],
-  latestRuns: [{ id: 101, name: 'build', event: 'push', status: 'completed', conclusion: 'success', url: 'https://example.com/run/101', created_at: 'now' }],
-  activeRuns: [],
+  latestRuns: [
+    { id: 102, name: 'deploy', event: 'workflow_dispatch', status: 'in_progress', conclusion: null, url: 'https://example.com/run/102', created_at: 'now' },
+    { id: 101, name: 'build', event: 'push', status: 'completed', conclusion: 'success', url: 'https://example.com/run/101', created_at: 'now' },
+  ],
+  activeRuns: [{ id: 102, name: 'deploy', event: 'workflow_dispatch', status: 'in_progress', conclusion: null, url: 'https://example.com/run/102', created_at: 'now' }],
 };
 
 describe('TargetCard', () => {
@@ -39,6 +43,7 @@ describe('TargetCard', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.stubGlobal('confirm', vi.fn(() => true));
+    (api.cancelRun as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     (api.getJobs as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (api.removeTarget as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     (api.restartTarget as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
@@ -65,7 +70,7 @@ describe('TargetCard', () => {
     expect(screen.getByText('Configure a repo to see run history.')).toBeInTheDocument();
   });
 
-  it('restarts, removes, and reruns workflow actions', async () => {
+  it('restarts, removes, cancels active runs, and reruns workflow actions', async () => {
     const user = userEvent.setup();
     render(
       <TargetCard
@@ -79,11 +84,13 @@ describe('TargetCard', () => {
 
     await user.click(screen.getAllByRole('button', { name: 'Restart runners' }).at(-1)!);
     await user.click(screen.getByRole('button', { name: 'Remove target' }));
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
     await user.click(screen.getAllByRole('button', { name: 'Rerun' }).at(-1)!);
     await user.click(screen.getByRole('button', { name: 'Retry failed' }));
 
     expect(api.restartTarget).toHaveBeenCalledWith('fleet-a');
     expect(api.removeTarget).toHaveBeenCalledWith('fleet-a');
+    expect(api.cancelRun).toHaveBeenCalledWith('fleet-a', 102);
     expect(api.rerunRun).toHaveBeenCalledWith('fleet-a', 101);
     expect(api.rerunFailed).toHaveBeenCalledWith('fleet-a', 101);
   });
@@ -142,6 +149,22 @@ describe('TargetCard', () => {
     expect(api.removeTarget).not.toHaveBeenCalled();
   });
 
+  it('renders resource metrics for runner containers', () => {
+    render(
+      <TargetCard
+        target={baseTarget}
+        busy={false}
+        onBusyChange={onBusyChange}
+        onStatusChange={onStatusChange}
+        onRefresh={onRefresh}
+      />,
+    );
+
+    expect(screen.getAllByText('12.5%').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('128 MB').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('3.0 GB').length).toBeGreaterThan(0);
+  });
+
   it('shows an empty jobs panel when a run has no jobs', async () => {
     const user = userEvent.setup();
     (api.getJobs as ReturnType<typeof vi.fn>).mockResolvedValue([]);
@@ -156,7 +179,7 @@ describe('TargetCard', () => {
       />,
     );
 
-    await user.click(screen.getByRole('button', { name: 'Jobs' }));
+    await user.click(screen.getAllByRole('button', { name: 'Jobs' }).at(0)!);
     await screen.findByText('No jobs found.');
   });
 });

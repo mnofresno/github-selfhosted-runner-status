@@ -2,6 +2,13 @@ import { cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FleetDashboard } from './FleetDashboard';
+import { api } from '../lib/api';
+
+vi.mock('../lib/api', () => ({
+  api: {
+    cancelRun: vi.fn(),
+  },
+}));
 
 describe('FleetDashboard', () => {
   afterEach(() => {
@@ -15,7 +22,10 @@ describe('FleetDashboard', () => {
     render(
       <FleetDashboard
         activeTargetId="fleet-b"
+        busy={false}
+        onBusyChange={vi.fn()}
         onSelectTarget={onSelectTarget}
+        onStatusChange={vi.fn()}
         status={{
           generatedAt: '2026-03-19T15:00:00.000Z',
           targets: [
@@ -28,7 +38,7 @@ describe('FleetDashboard', () => {
               repository: 'octo/web',
               labels: ['self-hosted'],
               runnersCount: 1,
-              localRunners: [{ name: 'fleet-a-0', state: 'running', status: 'Up' }],
+              localRunners: [{ name: 'fleet-a-0', state: 'running', status: 'Up', cpuPercent: 10.5, memoryBytes: 256 * 1024 * 1024, diskBytes: 2 * 1024 * 1024 * 1024 }],
               githubRunners: [{ id: 1, name: 'gh-a', status: 'online', busy: false, labels: ['linux'], os: 'linux' }],
               latestRuns: [{ id: 101, name: 'build', event: 'push', status: 'completed', conclusion: 'success', url: '#', created_at: 'now' }],
               activeRuns: [],
@@ -41,7 +51,7 @@ describe('FleetDashboard', () => {
               repository: 'octo',
               labels: ['self-hosted'],
               runnersCount: 2,
-              localRunners: [{ name: 'fleet-b-0', state: 'running', status: 'Up' }],
+              localRunners: [{ name: 'fleet-b-0', state: 'running', status: 'Up', cpuPercent: 4.5, memoryBytes: 128 * 1024 * 1024, diskBytes: 1024 * 1024 * 1024 }],
               githubRunners: [{ id: 2, name: 'gh-b', status: 'offline', busy: true, labels: ['linux'], os: 'linux' }],
               latestRuns: [],
               activeRuns: [{ id: 102, name: 'deploy', event: 'workflow_dispatch', status: 'in_progress', conclusion: null, url: '#', created_at: 'now' }],
@@ -69,8 +79,14 @@ describe('FleetDashboard', () => {
     expect(screen.getAllByText('down').length).toBeGreaterThan(0);
     expect(screen.getAllByText('1 active job').length).toBeGreaterThan(0);
     expect(screen.getAllByText('No repo feed').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('10.5%').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('256 MB').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('2.0 GB').length).toBeGreaterThan(0);
 
     await user.click(screen.getAllByRole('button', { name: 'Open' })[0]);
     expect(onSelectTarget).toHaveBeenCalledWith('fleet-a');
+
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(api.cancelRun).toHaveBeenCalledWith('fleet-b', 102);
   });
 });

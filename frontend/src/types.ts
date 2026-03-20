@@ -5,6 +5,10 @@ export type RunnerState = {
   status: string;
   image?: string;
   created?: number;
+  cpuPercent?: number;
+  memoryBytes?: number;
+  memoryLimitBytes?: number;
+  diskBytes?: number;
 };
 
 export type GithubRunner = {

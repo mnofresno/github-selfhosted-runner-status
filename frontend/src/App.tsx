@@ -129,7 +129,10 @@ export function App() {
             <FleetDashboard
               status={status}
               activeTargetId={activeTargetId}
+              busy={busy}
+              onBusyChange={setBusy}
               onSelectTarget={(targetId) => setActiveTab(`target:${targetId}`)}
+              onStatusChange={setActionStatus}
             />
           ) : null}
 

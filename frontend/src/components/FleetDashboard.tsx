@@ -1,9 +1,13 @@
 import type { FleetStatus, Target } from '../types';
+import { api } from '../lib/api';
 
 type FleetDashboardProps = {
   status: FleetStatus;
   activeTargetId: string;
   onSelectTarget: (targetId: string) => void;
+  busy: boolean;
+  onBusyChange: (busy: boolean) => void;
+  onStatusChange: (message: string) => void;
 };
 
 function formatRunnerCoverage(target: Target) {
@@ -48,7 +52,49 @@ function resolveRunState(target: Target) {
   return `${latestRun.name}: ${latestRun.conclusion || 'completed'}`;
 }
 
-export function FleetDashboard({ status, activeTargetId, onSelectTarget }: FleetDashboardProps) {
+function sumRunnerMetric(target: Target, key: 'cpuPercent' | 'memoryBytes' | 'diskBytes') {
+  return target.localRunners.reduce((total, runner) => total + (runner[key] || 0), 0);
+}
+
+function formatBytes(bytes: number) {
+  if (!bytes) return '-';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index += 1;
+  }
+  return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function formatCpu(target: Target) {
+  const cpu = sumRunnerMetric(target, 'cpuPercent');
+  return cpu ? `${cpu.toFixed(1)}%` : '-';
+}
+
+function formatMemory(target: Target) {
+  return formatBytes(sumRunnerMetric(target, 'memoryBytes'));
+}
+
+function formatDisk(target: Target) {
+  return formatBytes(sumRunnerMetric(target, 'diskBytes'));
+}
+
+export function FleetDashboard({ status, activeTargetId, onSelectTarget, busy, onBusyChange, onStatusChange }: FleetDashboardProps) {
+  async function cancelRun(targetId: string, runId: number) {
+    onBusyChange(true);
+    onStatusChange(`Canceling run ${runId}...`);
+    try {
+      await api.cancelRun(targetId, runId);
+      onStatusChange(`Run ${runId} cancel requested.`);
+    } catch (error) {
+      onStatusChange(`Failed: ${(error as Error).message}`);
+    } finally {
+      onBusyChange(false);
+    }
+  }
+
   return (
     <section className="dashboard-grid">
       <section className="card summary-table-card">
@@ -69,6 +115,9 @@ export function FleetDashboard({ status, activeTargetId, onSelectTarget }: Fleet
               <th>Health</th>
               <th>Local</th>
               <th>GitHub</th>
+              <th>CPU</th>
+              <th>Memory</th>
+              <th>Disk</th>
               <th>Jobs</th>
               <th></th>
             </tr>
@@ -88,15 +137,31 @@ export function FleetDashboard({ status, activeTargetId, onSelectTarget }: Fleet
                   <td><span className={`tone tone-${health.tone}`}>{health.label}</span></td>
                   <td>{formatRunnerCoverage(target)}</td>
                   <td>{formatGithubAvailability(target)}</td>
+                  <td>{formatCpu(target)}</td>
+                  <td>{formatMemory(target)}</td>
+                  <td>{formatDisk(target)}</td>
                   <td>{resolveRunState(target)}</td>
                   <td>
-                    <button
-                      type="button"
-                      className={activeTargetId === target.id ? 'accent' : ''}
-                      onClick={() => onSelectTarget(target.id)}
-                    >
-                      Open
-                    </button>
+                    <div className="actions">
+                      <button
+                        type="button"
+                        className={activeTargetId === target.id ? 'accent' : ''}
+                        onClick={() => onSelectTarget(target.id)}
+                      >
+                        Open
+                      </button>
+                      {target.activeRuns.map((run) => (
+                        <button
+                          key={run.id}
+                          type="button"
+                          className="danger"
+                          disabled={busy}
+                          onClick={() => void cancelRun(target.id, run.id)}
+                        >
+                          Cancel
+                        </button>
+                      ))}
+                    </div>
                   </td>
                 </tr>
               );
@@ -126,6 +191,9 @@ export function FleetDashboard({ status, activeTargetId, onSelectTarget }: Fleet
               <div className="health-card-stats">
                 <span>Local {running}/{target.runnersCount}</span>
                 <span>Busy {busy}</span>
+                <span>CPU {formatCpu(target)}</span>
+                <span>Mem {formatMemory(target)}</span>
+                <span>Disk {formatDisk(target)}</span>
                 <span>{resolveRunState(target)}</span>
               </div>
             </button>

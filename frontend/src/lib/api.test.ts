@@ -36,6 +36,7 @@ describe('api', () => {
     await api.getOwners('fleet-a', 'oc');
     await api.getRepos('fleet-a', 'octo', 'we');
     await api.getJobs('fleet-a', 101);
+    await api.cancelRun('fleet-a', 101);
     await api.rerunRun('fleet-a', 101);
     await api.rerunFailed('fleet-a', 101);
     await api.rerunJob('fleet-a', 55);
@@ -46,6 +47,7 @@ describe('api', () => {
       '/api/github/owners?targetId=fleet-a&q=oc',
       '/api/github/repos?owner=octo&targetId=fleet-a&q=we',
       '/api/targets/fleet-a/runs/101/jobs',
+      '/api/targets/fleet-a/runs/101/cancel',
       '/api/targets/fleet-a/runs/101/rerun',
       '/api/targets/fleet-a/runs/101/rerun-failed',
       '/api/targets/fleet-a/jobs/55/rerun',

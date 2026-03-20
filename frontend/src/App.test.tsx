@@ -16,6 +16,7 @@ vi.mock('./lib/api', () => ({
     rerunRun: vi.fn(),
     rerunFailed: vi.fn(),
     rerunJob: vi.fn(),
+    cancelRun: vi.fn(),
   },
 }));
 
@@ -34,8 +35,8 @@ const statusFixture = {
       runnerGroup: 'Default',
       description: 'Primary fleet',
       localRunners: [
-        { name: 'fleet-a-0', state: 'running', status: 'Up', image: 'runner:latest' },
-        { name: 'fleet-a-1', state: 'exited', status: 'Exited', image: 'runner:latest' },
+        { name: 'fleet-a-0', state: 'running', status: 'Up', image: 'runner:latest', cpuPercent: 8.5, memoryBytes: 256 * 1024 * 1024, diskBytes: 2 * 1024 * 1024 * 1024 },
+        { name: 'fleet-a-1', state: 'exited', status: 'Exited', image: 'runner:latest', cpuPercent: 0, memoryBytes: 64 * 1024 * 1024, diskBytes: 512 * 1024 * 1024 },
       ],
       githubRunners: [
         { id: 1, name: 'gh-runner-1', status: 'online', busy: true, labels: ['linux'], os: 'linux' },
@@ -43,7 +44,7 @@ const statusFixture = {
       latestRuns: [
         { id: 101, name: 'build', event: 'push', status: 'completed', conclusion: 'success', url: 'https://example.com/run/101', created_at: 'now' },
       ],
-      activeRuns: [],
+      activeRuns: [{ id: 102, name: 'deploy', event: 'workflow_dispatch', status: 'in_progress', conclusion: null, url: 'https://example.com/run/102', created_at: 'now' }],
     },
   ],
 };
@@ -70,6 +71,7 @@ describe('App', () => {
     (api.rerunRun as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     (api.rerunFailed as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     (api.rerunJob as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    (api.cancelRun as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
   });
 
   it('loads and renders fleet status', async () => {
@@ -79,7 +81,9 @@ describe('App', () => {
 
     await screen.findByRole('heading', { name: 'Fleet overview' });
     expect(screen.getAllByText('octo/web').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('build: success').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('1 active job').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('320 MB').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('2.5 GB').length).toBeGreaterThan(0);
     expect(screen.getByRole('button', { name: 'Fleet A' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Add target' })).toBeInTheDocument();
     expect(api.getStatus).toHaveBeenCalled();
@@ -107,10 +111,13 @@ describe('App', () => {
     expect(api.getStatus).toHaveBeenCalledTimes(2);
   });
 
-  it('shows jobs and lets a job rerun be requested', async () => {
+  it('shows jobs and lets a run cancel and job rerun be requested', async () => {
     const user = userEvent.setup();
     render(<App />);
     await screen.findByRole('heading', { name: 'Fleet overview' });
+
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(api.cancelRun).toHaveBeenCalledWith('fleet-a', 102);
 
     await user.click(screen.getByRole('button', { name: 'Fleet A' }));
     await screen.findByRole('heading', { name: 'Fleet A' });

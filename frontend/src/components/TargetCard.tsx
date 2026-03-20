@@ -25,11 +25,36 @@ function Tone({ value, tone }: { value: string; tone: 'ok' | 'warn' | 'danger' }
   return <span className={`tone tone-${tone}`}>{value}</span>;
 }
 
+function formatBytes(bytes?: number) {
+  if (!bytes) return '-';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index += 1;
+  }
+  return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function summarizeRunnerResources(target: Target) {
+  return target.localRunners.reduce((totals, runner) => ({
+    cpuPercent: totals.cpuPercent + (runner.cpuPercent || 0),
+    memoryBytes: totals.memoryBytes + (runner.memoryBytes || 0),
+    diskBytes: totals.diskBytes + (runner.diskBytes || 0),
+  }), {
+    cpuPercent: 0,
+    memoryBytes: 0,
+    diskBytes: 0,
+  });
+}
+
 function RunActions({
   targetId,
   run,
   busy,
   onBusyChange,
+  onCancelRun,
   onStatusChange,
   onJobsLoaded,
 }: {
@@ -37,6 +62,7 @@ function RunActions({
   run: WorkflowRun;
   busy: boolean;
   onBusyChange: (busy: boolean) => void;
+  onCancelRun: (runId: number) => Promise<void>;
   onStatusChange: (message: string) => void;
   onJobsLoaded: (jobs: WorkflowJob[]) => void;
 }) {
@@ -76,7 +102,9 @@ function RunActions({
           <button type="button" onClick={() => void trigger('rerunRun')} disabled={busy}>Rerun</button>
           <button type="button" onClick={() => void trigger('rerunFailed')} disabled={busy}>Retry failed</button>
         </>
-      ) : null}
+      ) : (
+        <button type="button" className="danger" onClick={() => void onCancelRun(run.id)} disabled={busy}>Cancel</button>
+      )}
     </div>
   );
 }
@@ -131,6 +159,22 @@ export function TargetCard({ target, busy, onBusyChange, onStatusChange, onRefre
     }
   }
 
+  async function cancelRun(runId: number) {
+    onBusyChange(true);
+    onStatusChange(`Canceling run ${runId}...`);
+    try {
+      await api.cancelRun(target.id, runId);
+      onStatusChange(`Run ${runId} cancel requested.`);
+      await onRefresh();
+    } catch (error) {
+      onStatusChange(`Failed: ${(error as Error).message}`);
+    } finally {
+      onBusyChange(false);
+    }
+  }
+
+  const resources = summarizeRunnerResources(target);
+
   return (
     <section className="card target-card">
       <div className="section-head">
@@ -159,6 +203,18 @@ export function TargetCard({ target, busy, onBusyChange, onStatusChange, onRefre
           <strong>{busyCount}</strong>
         </div>
         <div>
+          <span className="summary-label">CPU</span>
+          <strong>{resources.cpuPercent ? `${resources.cpuPercent.toFixed(1)}%` : '-'}</strong>
+        </div>
+        <div>
+          <span className="summary-label">Memory</span>
+          <strong>{formatBytes(resources.memoryBytes)}</strong>
+        </div>
+        <div>
+          <span className="summary-label">Disk</span>
+          <strong>{formatBytes(resources.diskBytes)}</strong>
+        </div>
+        <div>
           <span className="summary-label">Labels</span>
           <div><LabelList labels={target.labels} /></div>
         </div>
@@ -169,7 +225,7 @@ export function TargetCard({ target, busy, onBusyChange, onStatusChange, onRefre
           <h3>Local Runner Containers</h3>
           <table>
             <thead>
-              <tr><th>Container</th><th>State</th><th>Status</th><th>Image</th></tr>
+              <tr><th>Container</th><th>State</th><th>Status</th><th>CPU</th><th>Memory</th><th>Disk</th><th>Image</th></tr>
             </thead>
             <tbody>
               {target.localRunners.length ? target.localRunners.map((runner) => (
@@ -177,10 +233,13 @@ export function TargetCard({ target, busy, onBusyChange, onStatusChange, onRefre
                   <td><code>{runner.name}</code></td>
                   <td><Tone value={runner.state} tone={runner.state === 'running' ? 'ok' : 'danger'} /></td>
                   <td>{runner.status}</td>
+                  <td>{runner.cpuPercent ? `${runner.cpuPercent.toFixed(1)}%` : '-'}</td>
+                  <td>{formatBytes(runner.memoryBytes)}</td>
+                  <td>{formatBytes(runner.diskBytes)}</td>
                   <td>{runner.image || '-'}</td>
                 </tr>
               )) : (
-                <tr><td colSpan={4}>No runners configured.</td></tr>
+                <tr><td colSpan={7}>No runners configured.</td></tr>
               )}
             </tbody>
           </table>
@@ -236,6 +295,7 @@ export function TargetCard({ target, busy, onBusyChange, onStatusChange, onRefre
                       run={run}
                       busy={busy}
                       onBusyChange={onBusyChange}
+                      onCancelRun={cancelRun}
                       onStatusChange={onStatusChange}
                       onJobsLoaded={setJobs}
                     />

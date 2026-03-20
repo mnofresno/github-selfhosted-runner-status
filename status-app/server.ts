@@ -16,6 +16,7 @@ type RequestOptions = {
 };
 type CreateServerOptions = {
   ensureRunnersForTargetFn?: typeof ensureRunnersForTarget;
+  forceCancelRunFn?: typeof forceCancelRun;
   getStatusFn?: typeof getStatus;
   githubOwnerSuggestionsFn?: typeof githubOwnerSuggestions;
   githubRepoSuggestionsFn?: typeof githubRepoSuggestions;
@@ -291,6 +292,18 @@ async function listManagedContainers() {
 async function inspectContainer(containerId) {
   const response = await docker(`/containers/${containerId}/json`);
   if (response.statusCode < 200 || response.statusCode >= 300) throw new Error(`Inspect failed: ${response.statusCode}`);
+  return response.body;
+}
+
+async function inspectContainerWithSize(containerId) {
+  const response = await docker(`/containers/${containerId}/json?size=1`);
+  if (response.statusCode < 200 || response.statusCode >= 300) throw new Error(`Inspect with size failed: ${response.statusCode}`);
+  return response.body;
+}
+
+async function readContainerStats(containerId) {
+  const response = await docker(`/containers/${containerId}/stats?stream=0`);
+  if (response.statusCode < 200 || response.statusCode >= 300) throw new Error(`Stats failed: ${response.statusCode}`);
   return response.body;
 }
 /* c8 ignore stop */
@@ -628,6 +641,31 @@ async function getRunnerContainerState(targetId, index) {
   const all = await listAllContainers();
   const match = all.find((c) => (c.Names || []).some((n) => n === `/${name}` || n === name));
   if (!match) return null;
+
+  let resourceUsage = {};
+  if (match.State === 'running') {
+    try {
+      const [stats, inspect] = await Promise.all([
+        readContainerStats(match.Id),
+        inspectContainerWithSize(match.Id),
+      ]);
+
+      const cpuUsage = (stats?.cpu_stats?.cpu_usage?.total_usage || 0) - (stats?.precpu_stats?.cpu_usage?.total_usage || 0);
+      const systemUsage = (stats?.cpu_stats?.system_cpu_usage || 0) - (stats?.precpu_stats?.system_cpu_usage || 0);
+      const onlineCpus = stats?.cpu_stats?.online_cpus || stats?.cpu_stats?.cpu_usage?.percpu_usage?.length || 1;
+      const cpuPercent = systemUsage > 0 ? (cpuUsage / systemUsage) * onlineCpus * 100 : 0;
+
+      resourceUsage = {
+        cpuPercent,
+        memoryBytes: stats?.memory_stats?.usage || 0,
+        memoryLimitBytes: stats?.memory_stats?.limit || 0,
+        diskBytes: inspect?.SizeRw || 0,
+      };
+    } catch {
+      resourceUsage = {};
+    }
+  }
+
   return {
     id: match.Id,
     name,
@@ -635,6 +673,7 @@ async function getRunnerContainerState(targetId, index) {
     status: match.Status,
     image: match.Image,
     created: match.Created,
+    ...resourceUsage,
   };
 }
 
@@ -730,6 +769,23 @@ async function rerunJob(target, jobId) {
   return { jobId, statusCode: response.statusCode };
 }
 
+async function forceCancelRun(target, runId) {
+  const forceCancel = await githubRequest(target.accessToken, `/repos/${target.owner}/${target.repo}/actions/runs/${runId}/force-cancel`, { method: 'POST' });
+  if ([202, 204, 409].includes(forceCancel.statusCode)) {
+    return { runId, endpoint: 'force-cancel', statusCode: forceCancel.statusCode };
+  }
+
+  if (forceCancel.statusCode === 404 || forceCancel.statusCode === 422) {
+    const fallback = await githubRequest(target.accessToken, `/repos/${target.owner}/${target.repo}/actions/runs/${runId}/cancel`, { method: 'POST' });
+    if (![202, 204, 409].includes(fallback.statusCode)) {
+      throw new Error(`Cancel request failed with status ${fallback.statusCode}`);
+    }
+    return { runId, endpoint: 'cancel', statusCode: fallback.statusCode };
+  }
+
+  throw new Error(`Force cancel failed with status ${forceCancel.statusCode}`);
+}
+
 /* ── Status Snapshot ─────────────────────────────────────────────────── */
 
 async function getTargetSnapshot(target) {
@@ -777,6 +833,7 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
   let targets = [...initialTargets];
   const {
     ensureRunnersForTargetFn = ensureRunnersForTarget,
+    forceCancelRunFn = forceCancelRun,
     getStatusFn = getStatus,
     githubOwnerSuggestionsFn = githubOwnerSuggestions,
     githubRepoSuggestionsFn = githubRepoSuggestions,
@@ -869,6 +926,16 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
     }
 
     res.json(await rerunWorkflowRunFn(target, req.params.runId));
+  }));
+
+  app.post('/api/targets/:targetId/runs/:runId/cancel', asyncRoute(async (req, res) => {
+    const target = resolveTarget(req.params.targetId);
+    if (!target) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+
+    res.json(await forceCancelRunFn(target, req.params.runId));
   }));
 
   app.post('/api/targets/:targetId/runs/:runId/rerun-failed', asyncRoute(async (req, res) => {

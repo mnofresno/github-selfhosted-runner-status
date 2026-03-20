@@ -46,6 +46,9 @@ export const api = {
   rerunRun(targetId: string, runId: number): Promise<void> {
     return readJson<void>(`/api/targets/${encodeURIComponent(targetId)}/runs/${runId}/rerun`, { method: 'POST' });
   },
+  cancelRun(targetId: string, runId: number): Promise<void> {
+    return readJson<void>(`/api/targets/${encodeURIComponent(targetId)}/runs/${runId}/cancel`, { method: 'POST' });
+  },
   rerunFailed(targetId: string, runId: number): Promise<void> {
     return readJson<void>(`/api/targets/${encodeURIComponent(targetId)}/runs/${runId}/rerun-failed`, { method: 'POST' });
   },

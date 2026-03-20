@@ -366,6 +366,7 @@ test('createServer serves target management and GitHub helper routes', async () 
   const ensureRunnersForTargetFn = async (target) => [{ action: 'launched', targetId: target.id }];
   const stopRunnersForTargetFn = async () => {};
   const listRunJobsFn = async (_target, runId) => [{ id: Number(runId), name: 'lint' }];
+  const forceCancelRunFn = async (_target, runId) => ({ runId, canceled: true });
   const rerunWorkflowRunFn = async (_target, runId) => ({ runId, rerun: true });
   const rerunFailedJobsFn = async (_target, runId) => ({ runId, failed: true });
   const rerunJobFn = async (_target, jobId) => ({ jobId, rerun: true });
@@ -388,6 +389,7 @@ test('createServer serves target management and GitHub helper routes', async () 
     ensureRunnersForTargetFn,
     stopRunnersForTargetFn,
     listRunJobsFn,
+    forceCancelRunFn,
     rerunWorkflowRunFn,
     rerunFailedJobsFn,
     rerunJobFn,
@@ -448,6 +450,9 @@ test('createServer serves target management and GitHub helper routes', async () 
     result = await requestJson(baseUrl, '/api/targets/missing/runs/44/rerun', { method: 'POST' });
     assert.equal(result.response.status, 404);
 
+    result = await requestJson(baseUrl, '/api/targets/missing/runs/44/cancel', { method: 'POST' });
+    assert.equal(result.response.status, 404);
+
     result = await requestJson(baseUrl, '/api/targets/missing/runs/44/rerun-failed', { method: 'POST' });
     assert.equal(result.response.status, 404);
 
@@ -468,6 +473,10 @@ test('createServer serves target management and GitHub helper routes', async () 
     result = await requestJson(baseUrl, '/api/targets/fleet-a/runs/44/rerun', { method: 'POST' });
     assert.equal(result.response.status, 200);
     assert.deepEqual(result.body, { runId: '44', rerun: true });
+
+    result = await requestJson(baseUrl, '/api/targets/fleet-a/runs/44/cancel', { method: 'POST' });
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body, { runId: '44', canceled: true });
 
     result = await requestJson(baseUrl, '/api/targets/fleet-a/runs/44/rerun-failed', { method: 'POST' });
     assert.equal(result.response.status, 200);
