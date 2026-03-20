@@ -54,7 +54,10 @@ describe('FleetDashboard', () => {
               localRunners: [{ name: 'fleet-b-0', state: 'running', status: 'Up', cpuPercent: 4.5, memoryBytes: 128 * 1024 * 1024, diskBytes: 1024 * 1024 * 1024 }],
               githubRunners: [{ id: 2, name: 'gh-b', status: 'offline', busy: true, labels: ['linux'], os: 'linux' }],
               latestRuns: [],
-              activeRuns: [{ id: 102, name: 'deploy', event: 'workflow_dispatch', status: 'in_progress', conclusion: null, url: '#', created_at: 'now' }],
+              activeRuns: [
+                { id: 103, name: 'queued deploy', event: 'workflow_dispatch', status: 'queued', conclusion: null, url: '#', created_at: 'now' },
+                { id: 102, name: 'deploy', event: 'workflow_dispatch', status: 'in_progress', conclusion: null, url: '#', created_at: 'now' },
+              ],
             },
             {
               id: 'fleet-c',
@@ -86,6 +89,7 @@ describe('FleetDashboard', () => {
     await user.click(screen.getAllByRole('button', { name: 'Open' })[0]);
     expect(onSelectTarget).toHaveBeenCalledWith('fleet-a');
 
+    expect(screen.getAllByRole('button', { name: 'Cancel' })).toHaveLength(1);
     await user.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(api.cancelRun).toHaveBeenCalledWith('fleet-b', 102);
   });

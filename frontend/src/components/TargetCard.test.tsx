@@ -30,9 +30,13 @@ const baseTarget = {
   githubRunners: [{ id: 1, name: 'gh-runner', status: 'online', busy: false, labels: ['linux'], os: 'linux' }],
   latestRuns: [
     { id: 102, name: 'deploy', event: 'workflow_dispatch', status: 'in_progress', conclusion: null, url: 'https://example.com/run/102', created_at: 'now' },
+    { id: 103, name: 'queued deploy', event: 'workflow_dispatch', status: 'queued', conclusion: null, url: 'https://example.com/run/103', created_at: 'now' },
     { id: 101, name: 'build', event: 'push', status: 'completed', conclusion: 'success', url: 'https://example.com/run/101', created_at: 'now' },
   ],
-  activeRuns: [{ id: 102, name: 'deploy', event: 'workflow_dispatch', status: 'in_progress', conclusion: null, url: 'https://example.com/run/102', created_at: 'now' }],
+  activeRuns: [
+    { id: 103, name: 'queued deploy', event: 'workflow_dispatch', status: 'queued', conclusion: null, url: 'https://example.com/run/103', created_at: 'now' },
+    { id: 102, name: 'deploy', event: 'workflow_dispatch', status: 'in_progress', conclusion: null, url: 'https://example.com/run/102', created_at: 'now' },
+  ],
 };
 
 describe('TargetCard', () => {
@@ -84,6 +88,7 @@ describe('TargetCard', () => {
 
     await user.click(screen.getAllByRole('button', { name: 'Restart runners' }).at(-1)!);
     await user.click(screen.getByRole('button', { name: 'Remove target' }));
+    expect(screen.getAllByRole('button', { name: 'Cancel' })).toHaveLength(1);
     await user.click(screen.getByRole('button', { name: 'Cancel' }));
     await user.click(screen.getAllByRole('button', { name: 'Rerun' }).at(-1)!);
     await user.click(screen.getByRole('button', { name: 'Retry failed' }));

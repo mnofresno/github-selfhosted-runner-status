@@ -36,8 +36,14 @@ function resolveHealth(target: Target) {
 }
 
 function resolveRunState(target: Target) {
-  if (target.activeRuns.length) {
-    return `${target.activeRuns.length} active job${target.activeRuns.length === 1 ? '' : 's'}`;
+  const inProgressRuns = target.activeRuns.filter((run) => run.status === 'in_progress');
+  if (inProgressRuns.length) {
+    return `${inProgressRuns.length} active job${inProgressRuns.length === 1 ? '' : 's'}`;
+  }
+
+  const queuedRuns = target.activeRuns.filter((run) => run.status === 'queued');
+  if (queuedRuns.length) {
+    return `${queuedRuns.length} queued run${queuedRuns.length === 1 ? '' : 's'}`;
   }
 
   const latestRun = target.latestRuns[0];
@@ -125,6 +131,7 @@ export function FleetDashboard({ status, activeTargetId, onSelectTarget, busy, o
           <tbody>
             {status.targets.map((target) => {
               const health = resolveHealth(target);
+              const cancellableRun = target.activeRuns.find((run) => run.status === 'in_progress');
               return (
                 <tr key={target.id}>
                   <td>
@@ -150,17 +157,16 @@ export function FleetDashboard({ status, activeTargetId, onSelectTarget, busy, o
                       >
                         Open
                       </button>
-                      {target.activeRuns.map((run) => (
+                      {cancellableRun ? (
                         <button
-                          key={run.id}
                           type="button"
                           className="danger"
                           disabled={busy}
-                          onClick={() => void cancelRun(target.id, run.id)}
+                          onClick={() => void cancelRun(target.id, cancellableRun.id)}
                         >
                           Cancel
                         </button>
-                      ))}
+                      ) : null}
                     </div>
                   </td>
                 </tr>

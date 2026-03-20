@@ -102,8 +102,10 @@ function RunActions({
           <button type="button" onClick={() => void trigger('rerunRun')} disabled={busy}>Rerun</button>
           <button type="button" onClick={() => void trigger('rerunFailed')} disabled={busy}>Retry failed</button>
         </>
-      ) : (
+      ) : run.status === 'in_progress' ? (
         <button type="button" className="danger" onClick={() => void onCancelRun(run.id)} disabled={busy}>Cancel</button>
+      ) : (
+        null
       )}
     </div>
   );
