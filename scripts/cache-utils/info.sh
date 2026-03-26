@@ -6,6 +6,16 @@ set -euo pipefail
 
 source "$(dirname "$0")/common.sh"
 
+list_project_dirs() {
+    find "${FLEET_CACHE_DIR}/projects" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | sort
+}
+
+project_id_from_dir() {
+    local project_dir="$1"
+    local relative_path="${project_dir#${FLEET_CACHE_DIR}/projects/}"
+    printf '%s\n' "$relative_path"
+}
+
 # Parse arguments
 PROJECT_ID=""
 SHOW_DETAILS=false
@@ -128,23 +138,26 @@ else
     # Projects statistics
     PROJECTS_DIR="${FLEET_CACHE_DIR}/projects"
     if [ -d "$PROJECTS_DIR" ]; then
-        PROJECT_COUNT=$(find "$PROJECTS_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l)
+        PROJECT_COUNT=$(list_project_dirs | wc -l)
         kv "Projects cached" "$PROJECT_COUNT"
         
         # Total builds
-        TOTAL_BUILDS=0
-        find "$PROJECTS_DIR" -type d -name "builds" | while read -r builds_dir; do
-            count=$(find "$builds_dir" -maxdepth 1 -mindepth 1 -type d -name "latest" -prune -o -type d -print | wc -l)
-            TOTAL_BUILDS=$((TOTAL_BUILDS + count))
-        done
+        TOTAL_BUILDS=$(find "$PROJECTS_DIR" -type d -name "builds" -exec sh -c '
+            count=0
+            for builds_dir in "$@"; do
+                builds=$(find "$builds_dir" -maxdepth 1 -mindepth 1 -type d ! -name latest | wc -l)
+                count=$((count + builds))
+            done
+            echo "$count"
+        ' sh {} + 2>/dev/null | tail -n 1)
         kv "Total builds" "$TOTAL_BUILDS"
         
         if [ "$SHOW_DETAILS" = true ] && [ "$PROJECT_COUNT" -gt 0 ]; then
             echo ""
             echo "  Projects:"
             # List projects with stats
-            find "$PROJECTS_DIR" -mindepth 1 -maxdepth 1 -type d | while read -r project; do
-                PROJECT_NAME=$(basename "$project")
+            list_project_dirs | while read -r project; do
+                PROJECT_NAME=$(project_id_from_dir "$project")
                 if validate_project_id "$PROJECT_NAME" 2>/dev/null; then
                     BUILD_COUNT=$(find "$project/builds" -maxdepth 1 -mindepth 1 -type d -name "latest" -prune -o -type d -print 2>/dev/null | wc -l)
                     PROJECT_SIZE=$(du -sb "$project" 2>/dev/null | cut -f1 || echo 0)
@@ -170,10 +183,10 @@ else
     # Check for lock files
     LOCKS_DIR="${FLEET_CACHE_DIR}/locks"
     if [ -d "$LOCKS_DIR" ]; then
-        LOCK_COUNT=$(find "$LOCKS_DIR" -name "*.lock" -type f | wc -l)
+        LOCK_COUNT=$(find "$LOCKS_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l)
         if [ "$LOCK_COUNT" -gt 0 ]; then
             echo ""
-            echo "  ⚠️  Found $LOCK_COUNT lock file(s)"
+            echo "  ⚠️  Found $LOCK_COUNT lock director$( [ "$LOCK_COUNT" -eq 1 ] && echo 'y' || echo 'ies' )"
             echo "  Some operations may be stuck or incomplete"
         fi
     fi

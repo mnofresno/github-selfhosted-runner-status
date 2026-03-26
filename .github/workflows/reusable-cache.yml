@@ -1,5 +1,4 @@
-name: 'Fleet Build Cache'
-description: 'Cache build artifacts across CI and deploy jobs using fleet shared cache'
+name: Fleet Build Cache
 
 on:
   workflow_call:
@@ -119,8 +118,8 @@ jobs:
               # Build fetch command
               FETCH_CMD="./fetch.sh \"${{ inputs.project_id }}\" \"${{ inputs.target_path }}\""
               
-              # Add commit if not "latest"
-              if [ "${{ inputs.cache_key }}" != "${{ github.sha }}" ] && [ -n "${{ inputs.cache_key }}" ]; then
+              # Fetch exact commit by default. Pass cache_key: latest to opt into latest.
+              if [ -n "${{ inputs.cache_key }}" ]; then
                 FETCH_CMD="$FETCH_CMD --commit=\"${{ inputs.cache_key }}\""
               fi
               

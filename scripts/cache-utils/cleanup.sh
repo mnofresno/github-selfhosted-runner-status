@@ -6,6 +6,12 @@ set -euo pipefail
 
 source "$(dirname "$0")/common.sh"
 
+list_project_ids() {
+    find "${FLEET_CACHE_DIR}/projects" -mindepth 2 -maxdepth 2 -type d 2>/dev/null \
+        | sed "s#^${FLEET_CACHE_DIR}/projects/##" \
+        | sort
+}
+
 # Parse arguments
 KEEP_LAST=10
 DRY_RUN=false
@@ -56,14 +62,13 @@ if [ -z "$PROJECT_ID" ]; then
     info "Cleaning all projects (keeping last $KEEP_LAST builds each)"
     
     # Find all project directories
-    PROJECTS_DIR="${FLEET_CACHE_DIR}/projects"
-    if [ ! -d "$PROJECTS_DIR" ]; then
+    if [ ! -d "${FLEET_CACHE_DIR}/projects" ]; then
         info "No projects found in cache"
         exit 0
     fi
     
     # Get list of projects
-    PROJECTS=$(find "$PROJECTS_DIR" -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
+    PROJECTS=$(list_project_ids)
     
     if [ -z "$PROJECTS" ]; then
         info "No projects found"
@@ -85,7 +90,7 @@ if [ -z "$PROJECT_ID" ]; then
             # Acquire lock for this project
             if acquire_lock "$PROJ" 10; then
                 # Count builds before cleanup
-                BUILD_DIR="${PROJECTS_DIR}/${PROJ}/builds"
+                BUILD_DIR="${FLEET_CACHE_DIR}/projects/${PROJ}/builds"
                 if [ -d "$BUILD_DIR" ]; then
                     BEFORE_COUNT=$(find "$BUILD_DIR" -maxdepth 1 -mindepth 1 -type d -name "latest" -prune -o -type d -print | wc -l)
                     BEFORE_SIZE=$(du -sb "$BUILD_DIR" 2>/dev/null | cut -f1 || echo 0)

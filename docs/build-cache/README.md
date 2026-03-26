@@ -1,6 +1,6 @@
 # Fleet Build Cache System
 
-A build artifact cache system for GitHub Actions runners that allows sharing build artifacts between CI jobs and deploy processes to avoid redundant rebuilds.
+A build artifact cache system for GitHub Actions runners that allows sharing build artifacts between CI jobs and deploy processes without changing existing fleets by default.
 
 ## Quick Start
 
@@ -9,15 +9,11 @@ A build artifact cache system for GitHub Actions runners that allows sharing bui
    sudo ./scripts/setup-cache-host.sh
    ```
 
-2. **Update docker-compose.yml** (already done in PR):
-   ```yaml
-   volumes:
-     - fleet-cache-global:/cache:rw
-   ```
+2. **Opt into runner mounts** by setting `FLEET_CACHE_VOLUME=fleet-cache-global` in `.env`.
 
 3. **Restart github-runner-fleet**:
    ```bash
-   docker compose down && docker compose up -d
+   docker compose up -d --build
    ```
 
 4. **Test the cache**:
@@ -84,7 +80,7 @@ Show cache statistics.
 
 ## Architecture
 
-- **Volume**: `fleet-cache-global` mounted at `/cache` in all runners
+- **Volume**: `fleet-cache-global` mounted at `/cache` only when `FLEET_CACHE_VOLUME` is configured
 - **Organization**: `projects/<owner>/<repo>/builds/<commit-sha>/`
 - **Hard links**: Used when source and destination are on same filesystem
 - **Locking**: Prevents concurrent access to same project cache
@@ -97,3 +93,4 @@ Show cache statistics.
 3. **Consistency**: Same artifacts in CI and production
 4. **Space efficient**: Hard links reduce storage duplication
 5. **Simple integration**: Drop-in scripts for existing workflows
+6. **Backward compatible**: no effect on fleets that do not opt in

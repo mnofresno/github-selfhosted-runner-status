@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 set -eu
 
 # Common functions for fleet build cache system
@@ -178,13 +178,10 @@ info() {
 # Human readable size
 human_size() {
     local bytes="$1"
-    if [ "$bytes" -ge 1073741824 ]; then
-        printf "%.2f GB" "$(echo "scale=2; $bytes / 1073741824" | bc)"
-    elif [ "$bytes" -ge 1048576 ]; then
-        printf "%.2f MB" "$(echo "scale=2; $bytes / 1048576" | bc)"
-    elif [ "$bytes" -ge 1024 ]; then
-        printf "%.2f KB" "$(echo "scale=2; $bytes / 1024" | bc)"
-    else
-        printf "%d B" "$bytes"
-    fi
+    awk -v bytes="$bytes" 'BEGIN {
+        if (bytes >= 1073741824) printf "%.2f GB", bytes / 1073741824;
+        else if (bytes >= 1048576) printf "%.2f MB", bytes / 1048576;
+        else if (bytes >= 1024) printf "%.2f KB", bytes / 1024;
+        else printf "%d B", bytes;
+    }'
 }

@@ -22,42 +22,42 @@ else
     echo "   Volume already exists"
 fi
 
-# Create mount point on host
+# Create host link path
 echo ""
-echo "2. Creating host mount point..."
+echo "2. Creating host cache link..."
 HOST_MOUNT_POINT="/var/cache/fleet"
-mkdir -p "$HOST_MOUNT_POINT"
+mkdir -p "$(dirname "$HOST_MOUNT_POINT")"
+VOLUME_PATH="/var/lib/docker/volumes/fleet-cache-global/_data"
 
-# Check if already mounted
-if mountpoint -q "$HOST_MOUNT_POINT"; then
-    echo "   Already mounted at $HOST_MOUNT_POINT"
+# Check if already linked
+if [ -L "$HOST_MOUNT_POINT" ] && [ "$(readlink "$HOST_MOUNT_POINT")" = "$VOLUME_PATH" ]; then
+    echo "   Already linked: $HOST_MOUNT_POINT -> $VOLUME_PATH"
 else
-    # Create a helper container to access the volume
-    echo "   Creating helper container for volume access..."
-    docker run -d \
-        --name fleet-cache-helper \
-        -v fleet-cache-global:/cache:rw \
-        --restart unless-stopped \
-        alpine tail -f /dev/null
-    
-    # Create symlink from helper container
-    HELPER_ID=$(docker inspect -f '{{.Id}}' fleet-cache-helper)
-    VOLUME_PATH="/var/lib/docker/volumes/fleet-cache-global/_data"
-    
-    # Try to symlink directly to volume data
     if [ -d "$VOLUME_PATH" ]; then
+        rm -rf "$HOST_MOUNT_POINT"
         ln -sfn "$VOLUME_PATH" "$HOST_MOUNT_POINT"
         echo "   Symlink created: $HOST_MOUNT_POINT -> $VOLUME_PATH"
     else
-        # Alternative: bind mount from container
-        echo "   Using bind mount from container..."
-        docker cp fleet-cache-helper:/cache "$HOST_MOUNT_POINT" 2>/dev/null || true
+        echo "   Docker volume path not found: $VOLUME_PATH"
+        exit 1
     fi
 fi
 
+# Create or refresh helper container used by tests and scripted copies
+echo ""
+echo "3. Ensuring helper container exists..."
+docker rm -f fleet-cache-helper >/dev/null 2>&1 || true
+docker run -d \
+    --name fleet-cache-helper \
+    -v fleet-cache-global:/cache:rw \
+    --restart unless-stopped \
+    ubuntu:24.04 tail -f /dev/null >/dev/null
+
+docker exec fleet-cache-helper bash -lc 'apt-get update >/dev/null && apt-get install -y bash coreutils findutils grep sed gawk jq >/dev/null'
+
 # Set permissions for git-autodeploy (www-data user)
 echo ""
-echo "3. Setting permissions..."
+echo "4. Setting permissions..."
 if id -u www-data >/dev/null 2>&1; then
     chown -R www-data:www-data "$HOST_MOUNT_POINT" 2>/dev/null || true
     chmod -R 0777 "$HOST_MOUNT_POINT" 2>/dev/null || true
@@ -69,7 +69,7 @@ fi
 
 # Copy scripts to cache volume
 echo ""
-echo "4. Deploying cache scripts to volume..."
+echo "5. Deploying cache scripts to volume..."
 SCRIPTS_SOURCE="$(dirname "$0")/cache-utils"
 if [ -d "$SCRIPTS_SOURCE" ]; then
     # Copy via helper container
@@ -99,7 +99,7 @@ fi
 
 # Create convenience symlink in /usr/local/bin
 echo ""
-echo "5. Creating convenience symlinks..."
+echo "6. Creating convenience symlinks..."
 for cmd in store fetch cleanup info; do
     if [ ! -f "/usr/local/bin/fleet-cache-$cmd" ]; then
         ln -sf "$HOST_MOUNT_POINT/scripts/$cmd.sh" "/usr/local/bin/fleet-cache-$cmd" 2>/dev/null || true
@@ -108,7 +108,7 @@ done
 
 # Test the setup
 echo ""
-echo "6. Testing setup..."
+echo "7. Testing setup..."
 if [ -d "$HOST_MOUNT_POINT" ] && [ -d "$HOST_MOUNT_POINT/scripts" ]; then
     echo "   Host mount point: $HOST_MOUNT_POINT ✓"
     
@@ -126,8 +126,8 @@ echo ""
 echo "=== Setup Complete ==="
 echo ""
 echo "Next steps:"
-echo "1. Update github-runner-fleet docker-compose.yml to include the volume"
-echo "2. Restart github-runner-fleet: docker compose up -d"
+echo "1. To opt into runner cache mounts, set FLEET_CACHE_VOLUME=fleet-cache-global in .env"
+echo "2. Restart github-runner-fleet: docker compose up -d --build"
 echo "3. Test with: fleet-cache-info"
 echo "4. Integrate with your project's CI/CD"
 echo ""

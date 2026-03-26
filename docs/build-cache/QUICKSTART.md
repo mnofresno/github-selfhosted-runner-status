@@ -32,16 +32,15 @@ sudo bash scripts/setup-cache-host.sh
 
 This will:
 - Create Docker volume `fleet-cache-global`
-- Mount it at `/var/cache/fleet` on host
+- Link it at `/var/cache/fleet` on host
 - Deploy cache scripts
 - Set proper permissions
 
-### Step 2: Update github-runner-fleet
+### Step 2: Opt Into Runner Cache Mounts
 
 ```bash
-# Update docker-compose.yml (already done in this PR)
-# Restart the service
 cd /var/www/github-runner-fleet
+printf '\nFLEET_CACHE_VOLUME=fleet-cache-global\n' >> .env
 docker compose up -d --build
 ```
 
