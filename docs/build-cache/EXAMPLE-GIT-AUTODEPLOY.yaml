@@ -1,0 +1,60 @@
+# Example .git-auto-deploy.yaml configuration with fleet cache
+# Place this in your project's root directory
+
+# Project configuration
+project_name: "bpf-application"
+deploy_to: "/var/www/bpf-application"
+
+# Git configuration
+branch: "main"
+remote: "origin"
+
+# Deployment hooks
+pre_fetch_commands: []
+
+post_fetch_commands:
+  # Try to fetch cached build for the deployed commit
+  - |
+    echo "=== Checking for cached build ==="
+    COMMIT_SHA=$(git rev-parse HEAD)
+    CACHE_DIR="/tmp/cache-build-$COMMIT_SHA"
+    
+    # Use fleet cache scripts (mounted at /var/cache/fleet on host)
+    if /var/cache/fleet/scripts/fetch.sh "bpf-project/bpf-application" "$CACHE_DIR"; then
+      echo "✅ Using cached build from commit $COMMIT_SHA"
+      
+      # Copy cached Next.js build
+      if [ -d "$CACHE_DIR/.next" ]; then
+        echo "Copying cached .next directory..."
+        rm -rf .next
+        cp -r "$CACHE_DIR/.next" .
+      fi
+      
+      # Copy cached public assets
+      if [ -d "$CACHE_DIR/public" ]; then
+        echo "Copying cached public directory..."
+        rm -rf public
+        cp -r "$CACHE_DIR/public" .
+      fi
+      
+      echo "Cache applied successfully"
+    else
+      echo "⚠️ No cache found, building fresh..."
+      
+      # Install dependencies
+      npm ci --production
+      
+      # Build the application
+      npm run build
+      
+      # Store the build in cache for next time
+      echo "Storing build in cache..."
+      /var/cache/fleet/scripts/store.sh "bpf-project/bpf-application" "." --include=".next,public"
+    fi
+
+post_deploy_commands:
+  # Restart application
+  - pm2 restart bpf-application || pm2 start npm --name "bpf-application" -- start
+  
+  # Cleanup
+  - rm -rf /tmp/cache-build-*

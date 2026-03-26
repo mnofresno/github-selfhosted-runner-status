@@ -33,6 +33,8 @@ const DEFAULT_WORKDIR = '/tmp/github-runner';
 const DEFAULT_DIND_IMAGE = 'docker:27-dind';
 const DEFAULT_RUNNERS_PER_TARGET = Math.max(1, Number.parseInt(process.env.RUNNERS_PER_TARGET || '1', 10));
 const DEFAULT_RUNNER_IMAGE = process.env.RUNNER_IMAGE || 'myoung34/github-runner:latest';
+const FLEET_CACHE_VOLUME = String(process.env.FLEET_CACHE_VOLUME || '').trim();
+const FLEET_CACHE_MOUNT_PATH = String(process.env.FLEET_CACHE_MOUNT_PATH || '/cache').trim() || '/cache';
 const HEALTHCHECK_INTERVAL_MS = Number.parseInt(process.env.HEALTHCHECK_INTERVAL_MS || '15000', 10);
 const DATA_DIR = process.env.DATA_DIR || '/app/data';
 const TARGETS_FILE = path.join(DATA_DIR, 'targets.json');
@@ -656,6 +658,11 @@ function stackId(targetId, index) {
   return `${targetId}-${index}`;
 }
 
+function getFleetCacheRunnerBind() {
+  if (!FLEET_CACHE_VOLUME) return '';
+  return `${FLEET_CACHE_VOLUME}:${FLEET_CACHE_MOUNT_PATH}:rw`;
+}
+
 function buildLabels(target, runnerName, role, sId) {
   return {
     [MANAGED_LABEL]: 'true',
@@ -674,6 +681,9 @@ async function launchRunnerStack(target, index) {
   const dvName = dockerVolumeName(target.id, index);
   const sId = stackId(target.id, index);
   const labels = [...target.labels, `target:${target.id}`, `scope:${target.scope}`].filter(Boolean);
+  const runnerBinds = [`${wName}:${target.runnerWorkdir}`];
+  const fleetCacheBind = getFleetCacheRunnerBind();
+  if (fleetCacheBind) runnerBinds.push(fleetCacheBind);
 
   const runnerEnv = [
     `ACCESS_TOKEN=${target.accessToken}`,
@@ -722,7 +732,7 @@ async function launchRunnerStack(target, index) {
       Labels: buildLabels(target, rName, 'runner', sId),
       HostConfig: {
         NetworkMode: `container:${dName}`,
-        Binds: [`${wName}:${target.runnerWorkdir}`],
+        Binds: runnerBinds,
         RestartPolicy: { Name: 'unless-stopped' },
       },
     });
@@ -1223,5 +1233,5 @@ module.exports = {
   readRunnerResourceCache, writeRunnerResourceCache, clearRunnerResourceCache,
   clearStatusSnapshotCache, getCachedStatus, renderClientShellFallback,
   loadPersistedTargets, saveTargets, ensureRunnersForTarget, resolveClientDistDir,
-  sanitizeStatusForClient, sanitizeTargetForClient,
+  sanitizeStatusForClient, sanitizeTargetForClient, getFleetCacheRunnerBind,
 };

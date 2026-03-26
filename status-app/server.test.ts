@@ -31,6 +31,7 @@ const {
   renderClientShellFallback,
   sanitizeStatusForClient,
   sanitizeTargetForClient,
+  getFleetCacheRunnerBind,
 } = require('./server.ts');
 
 const fs = require('fs');
@@ -108,6 +109,10 @@ test('parseListenPort returns default for invalid input', () => {
 
 test('parseListenPort returns default for empty input', () => {
   assert.equal(parseListenPort(''), 8080);
+});
+
+test('getFleetCacheRunnerBind is empty by default in tests', () => {
+  assert.equal(getFleetCacheRunnerBind(), '');
 });
 
 /* ── normalizeTarget ─────────────────────────────────────────────── */

@@ -1,0 +1,187 @@
+name: Fleet Build Cache
+
+on:
+  workflow_call:
+    inputs:
+      operation:
+        required: true
+        type: choice
+        options: ['store', 'fetch', 'info']
+        description: 'Cache operation to perform'
+      project_id:
+        required: true
+        type: string
+        description: 'Project identifier (e.g., owner/repo)'
+      cache_key:
+        required: false
+        type: string
+        default: ${{ github.sha }}
+        description: 'Cache key (default: commit SHA)'
+      source_path:
+        required: false
+        type: string
+        description: 'Source path to cache (for store operation)'
+      target_path:
+        required: false
+        type: string
+        description: 'Target path (for fetch operation)'
+      keep_last:
+        required: false
+        type: string
+        default: '10'
+        description: 'Keep last N builds (for store operation)'
+      force:
+        required: false
+        type: boolean
+        default: false
+        description: 'Force overwrite (for fetch operation)'
+
+    outputs:
+      cache_hit:
+        description: 'Whether cache was found and used'
+        value: ${{ jobs.cache.outputs.hit }}
+      cache_size:
+        description: 'Size of cached artifacts in bytes'
+        value: ${{ jobs.cache.outputs.size }}
+      cache_commit:
+        description: 'Commit SHA of cached artifacts'
+        value: ${{ jobs.cache.outputs.commit }}
+
+jobs:
+  cache:
+    runs-on: [self-hosted, linux, x64]
+    outputs:
+      hit: ${{ steps.cache-op.outputs.hit }}
+      size: ${{ steps.cache-op.outputs.size }}
+      commit: ${{ steps.cache-op.outputs.commit }}
+    steps:
+      - name: Validate inputs
+        id: validate
+        run: |
+          # Validate required inputs based on operation
+          case "${{ inputs.operation }}" in
+            store)
+              if [ -z "${{ inputs.source_path }}" ]; then
+                echo "ERROR: source_path is required for store operation" >&2
+                exit 1
+              fi
+              ;;
+            fetch)
+              if [ -z "${{ inputs.target_path }}" ]; then
+                echo "ERROR: target_path is required for fetch operation" >&2
+                exit 1
+              fi
+              ;;
+          esac
+          
+          echo "Validated inputs for ${{ inputs.operation }} operation"
+
+      - name: Perform cache operation
+        id: cache-op
+        run: |
+          set -e
+          
+          # Ensure cache directory exists
+          if [ ! -d "/cache" ]; then
+            echo "ERROR: Cache directory /cache not mounted" >&2
+            echo "Make sure fleet-cache-global volume is mounted on runners" >&2
+            exit 1
+          fi
+          
+          # Navigate to cache scripts
+          CACHE_SCRIPTS="/cache/scripts"
+          if [ ! -d "$CACHE_SCRIPTS" ]; then
+            echo "ERROR: Cache scripts not found in $CACHE_SCRIPTS" >&2
+            echo "Make sure scripts are deployed to the cache volume" >&2
+            exit 1
+          fi
+          
+          cd "$CACHE_SCRIPTS"
+          
+          case "${{ inputs.operation }}" in
+            store)
+              echo "Storing artifacts to cache..."
+              ./store.sh \
+                "${{ inputs.project_id }}" \
+                "${{ inputs.cache_key }}" \
+                "${{ inputs.source_path }}" \
+                --keep-last="${{ inputs.keep_last }}"
+              
+              echo "hit=false" >> $GITHUB_OUTPUT
+              echo "size=0" >> $GITHUB_OUTPUT
+              echo "commit=${{ inputs.cache_key }}" >> $GITHUB_OUTPUT
+              ;;
+              
+            fetch)
+              echo "Fetching artifacts from cache..."
+              
+              # Build fetch command
+              FETCH_CMD="./fetch.sh \"${{ inputs.project_id }}\" \"${{ inputs.target_path }}\""
+              
+              # Fetch exact commit by default. Pass cache_key: latest to opt into latest.
+              if [ -n "${{ inputs.cache_key }}" ]; then
+                FETCH_CMD="$FETCH_CMD --commit=\"${{ inputs.cache_key }}\""
+              fi
+              
+              # Add force if requested
+              if [ "${{ inputs.force }}" = "true" ]; then
+                FETCH_CMD="$FETCH_CMD --force"
+              fi
+              
+              # Execute fetch
+              if eval "$FETCH_CMD"; then
+                echo "Cache hit!" >&2
+                echo "hit=true" >> $GITHUB_OUTPUT
+                
+                # Calculate size
+                if [ -d "${{ inputs.target_path }}" ]; then
+                  SIZE=$(du -sb "${{ inputs.target_path }}" | cut -f1)
+                  echo "size=$SIZE" >> $GITHUB_OUTPUT
+                else
+                  echo "size=0" >> $GITHUB_OUTPUT
+                fi
+                
+                # Get commit from latest symlink
+                LATEST_SYMLINK="/cache/projects/${{ inputs.project_id }}/builds/latest"
+                if [ -L "$LATEST_SYMLINK" ]; then
+                  COMMIT=$(basename $(readlink -f "$LATEST_SYMLINK"))
+                  echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+                else
+                  echo "commit=unknown" >> $GITHUB_OUTPUT
+                fi
+              else
+                echo "Cache miss" >&2
+                echo "hit=false" >> $GITHUB_OUTPUT
+                echo "size=0" >> $GITHUB_OUTPUT
+                echo "commit=" >> $GITHUB_OUTPUT
+              fi
+              ;;
+              
+            info)
+              echo "Cache information for ${{ inputs.project_id }}:" >&2
+              ./info.sh --project="${{ inputs.project_id }}"
+              
+              echo "hit=false" >> $GITHUB_OUTPUT
+              echo "size=0" >> $GITHUB_OUTPUT
+              echo "commit=" >> $GITHUB_OUTPUT
+              ;;
+              
+            *)
+              echo "ERROR: Unknown operation: ${{ inputs.operation }}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Log cache operation result
+        if: always()
+        run: |
+          echo "Cache operation completed:"
+          echo "  Operation: ${{ inputs.operation }}"
+          echo "  Project: ${{ inputs.project_id }}"
+          echo "  Cache hit: ${{ steps.cache-op.outputs.hit }}"
+          if [ "${{ steps.cache-op.outputs.size }}" != "0" ]; then
+            echo "  Cache size: ${{ steps.cache-op.outputs.size }} bytes"
+          fi
+          if [ -n "${{ steps.cache-op.outputs.commit }}" ]; then
+            echo "  Cache commit: ${{ steps.cache-op.outputs.commit }}"
+          fi

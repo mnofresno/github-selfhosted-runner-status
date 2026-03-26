@@ -66,6 +66,8 @@ Visit `http://localhost:3571`.
 | `HEALTHCHECK_INTERVAL_MS` | `15000` | How often to check runner health |
 | `STATUS_BIND` | `127.0.0.1:3571` | Dashboard bind address |
 | `LABELS` | `self-hosted,linux,x64` | Default runner labels |
+| `FLEET_CACHE_VOLUME` | — | Optional Docker volume to mount into runner containers for `/cache` workflows |
+| `FLEET_CACHE_MOUNT_PATH` | `/cache` | Mount path used inside runners when `FLEET_CACHE_VOLUME` is set |
 
 ### Target Configuration
 
@@ -109,3 +111,9 @@ Example target:
 - `CI` runs `npm ci`, `npm run typecheck`, `npm test`, and `npm run build`.
 - `Deploy` runs the same verification on pushes to `main` and then triggers the existing production auto-deploy.
 - Production now builds the frontend bundle into the container image and serves it from the Node runtime.
+
+## Build Cache
+
+The fleet build cache described in `docs/build-cache/README.md` is opt-in.
+
+If you want self-hosted runners launched by this fleet to expose `/cache`, set `FLEET_CACHE_VOLUME=fleet-cache-global` in `.env`, run `sudo bash scripts/setup-cache-host.sh`, and restart the fleet. If you leave that unset, the fleet behaves exactly as before.
