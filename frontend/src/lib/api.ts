@@ -1,4 +1,4 @@
-import type { FleetStatus, TargetFormPayload, WorkflowJob } from '../types';
+import type { FleetStatus, TargetFormPayload, TargetUpdatePayload, WorkflowJob } from '../types';
 
 async function readJson<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
   const response = await fetch(input, init);
@@ -24,6 +24,13 @@ export const api = {
   },
   removeTarget(targetId: string): Promise<void> {
     return readJson<void>(`/api/targets/${encodeURIComponent(targetId)}`, { method: 'DELETE' });
+  },
+  updateTarget(targetId: string, payload: TargetUpdatePayload): Promise<void> {
+    return readJson<void>(`/api/targets/${encodeURIComponent(targetId)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
   },
   restartTarget(targetId: string): Promise<void> {
     return readJson<void>(`/api/targets/${encodeURIComponent(targetId)}/restart`, { method: 'POST' });

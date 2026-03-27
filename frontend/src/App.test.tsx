@@ -10,6 +10,7 @@ vi.mock('./lib/api', () => ({
     addTarget: vi.fn(),
     removeTarget: vi.fn(),
     restartTarget: vi.fn(),
+    updateTarget: vi.fn(),
     getOwners: vi.fn(),
     getRepos: vi.fn(),
     getJobs: vi.fn(),
@@ -68,6 +69,7 @@ describe('App', () => {
     (api.addTarget as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     (api.restartTarget as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     (api.removeTarget as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    (api.updateTarget as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     (api.rerunRun as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     (api.rerunFailed as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     (api.rerunJob as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
@@ -144,6 +146,19 @@ describe('App', () => {
 
     await user.click(screen.getByRole('button', { name: 'Remove target' }));
     await waitFor(() => expect(api.removeTarget).toHaveBeenCalledWith('fleet-a'));
+  });
+
+  it('updates runner capacity for an existing target', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Fleet overview' });
+
+    await user.click(screen.getByRole('button', { name: 'Fleet A' }));
+    await screen.findByRole('heading', { name: 'Fleet A' });
+
+    await user.click(screen.getByRole('button', { name: 'Increase runners' }));
+    await waitFor(() => expect(api.updateTarget).toHaveBeenCalledWith('fleet-a', { runnersCount: 3 }));
+    expect(api.getStatus).toHaveBeenCalledTimes(2);
   });
 
   it('surfaces fetch errors', async () => {

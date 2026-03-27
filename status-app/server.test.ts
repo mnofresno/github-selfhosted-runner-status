@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const {
   createServer,
   normalizeTarget,
+  normalizeRunnersCount,
   slugify,
   parseLabels,
   parseListenPort,
@@ -12,6 +13,7 @@ const {
   normalizeAccessibleOwners,
   resolveAutocompleteToken,
   validateTargetFormInput,
+  validateTargetRunnersCountInput,
   buildAutocompleteCacheKey,
   readAutocompleteCache,
   writeAutocompleteCache,
@@ -88,6 +90,12 @@ test('parseLabels handles array input', () => {
 
 test('parseLabels filters empty entries', () => {
   assert.deepEqual(parseLabels('a,,b,'), ['a', 'b']);
+});
+
+test('normalizeRunnersCount falls back and enforces a minimum of one', () => {
+  assert.equal(normalizeRunnersCount('3'), 3);
+  assert.equal(normalizeRunnersCount('0'), 1);
+  assert.equal(normalizeRunnersCount('abc', 2), 2);
 });
 
 test('resolveClientDistDir points at an existing frontend build path when present', () => {
@@ -371,6 +379,28 @@ test('validateTargetFormInput requires at least one label', () => {
   assert.match(result.errors.join(' '), /At least one label is required/);
 });
 
+test('validateTargetRunnersCountInput accepts valid runner counts', () => {
+  assert.deepEqual(validateTargetRunnersCountInput({ runnersCount: '3' }), {
+    valid: true,
+    runnersCount: 3,
+  });
+});
+
+test('validateTargetRunnersCountInput rejects invalid values', () => {
+  assert.deepEqual(validateTargetRunnersCountInput({}), {
+    valid: false,
+    error: 'Runners Count is required.',
+  });
+  assert.deepEqual(validateTargetRunnersCountInput({ runnersCount: '0' }), {
+    valid: false,
+    error: 'Runners Count must be at least 1.',
+  });
+  assert.deepEqual(validateTargetRunnersCountInput({ runnersCount: 'abc' }), {
+    valid: false,
+    error: 'Runners Count must be a whole number.',
+  });
+});
+
 /* ── Target Persistence ─────────────────────────────────────────── */
 
 test('loadPersistedTargets returns empty array for missing file', () => {
@@ -474,6 +504,13 @@ test('createServer serves target management and GitHub helper routes', async () 
     result = await requestJson(baseUrl, '/api/targets/missing', { method: 'DELETE' });
     assert.equal(result.response.status, 404);
 
+    result = await requestJson(baseUrl, '/api/targets/missing', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runnersCount: 2 }),
+    });
+    assert.equal(result.response.status, 404);
+
     result = await requestJson(baseUrl, '/api/targets/missing/restart', { method: 'POST' });
     assert.equal(result.response.status, 404);
 
@@ -498,6 +535,25 @@ test('createServer serves target management and GitHub helper routes', async () 
     result = await requestJson(baseUrl, '/api/targets/fleet-a/restart', { method: 'POST' });
     assert.equal(result.response.status, 200);
     assert.deepEqual(result.body, [{ action: 'launched', targetId: 'fleet-a' }]);
+
+    result = await requestJson(baseUrl, '/api/targets/fleet-a', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runnersCount: '0' }),
+    });
+    assert.equal(result.response.status, 400);
+
+    result = await requestJson(baseUrl, '/api/targets/fleet-a', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runnersCount: 3 }),
+    });
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body.scaled, {
+      previousRunnersCount: 1,
+      runnersCount: 3,
+    });
+    assert.equal(result.body.target.runnersCount, 3);
 
     result = await requestJson(baseUrl, '/api/targets/fleet-a/launch', { method: 'POST' });
     assert.equal(result.response.status, 200);
@@ -644,6 +700,113 @@ test('createServer invalidates cached status after target mutations', async () =
     assert.deepEqual(result.body.targets, [{ id: 'fleet-a' }, { id: 'fleet-b' }]);
   } finally {
     clearStatusSnapshotCache();
+    server.close();
+    await once(server, 'close');
+  }
+});
+
+test('createServer scales down targets by removing only the trailing runners', async () => {
+  clearStatusSnapshotCache();
+  const stopRunnersForTargetFn = async () => {};
+  const stopSpy = stopRunnersForTargetFn;
+
+  const existingTarget = normalizeTarget({
+    id: 'fleet-a',
+    name: 'Fleet A',
+    scope: 'org',
+    owner: 'octo',
+    accessToken: 'target-token',
+    labels: 'self-hosted',
+    runnersCount: 3,
+  });
+
+  const calls = [];
+  const { server, baseUrl } = await startTestServer([existingTarget], {
+    ensureRunnersForTargetFn: async () => [],
+    saveTargetsFn: async () => {},
+    stopRunnersForTargetFn: async (...args) => {
+      calls.push(args);
+      return stopSpy(...args);
+    },
+  });
+
+  try {
+    const result = await requestJson(baseUrl, '/api/targets/fleet-a', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runnersCount: 1 }),
+    });
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body.scaled, {
+      previousRunnersCount: 3,
+      runnersCount: 1,
+    });
+    assert.deepEqual(calls, [['fleet-a', 3, 1]]);
+  } finally {
+    clearStatusSnapshotCache();
+    server.close();
+    await once(server, 'close');
+  }
+});
+
+test('createServer returns the existing target when runner capacity is unchanged', async () => {
+  clearStatusSnapshotCache();
+  const existingTarget = normalizeTarget({
+    id: 'fleet-a',
+    name: 'Fleet A',
+    scope: 'org',
+    owner: 'octo',
+    accessToken: 'target-token',
+    labels: 'self-hosted',
+    runnersCount: 2,
+  });
+
+  const { server, baseUrl } = await startTestServer([existingTarget], {
+    ensureRunnersForTargetFn: async () => {
+      throw new Error('should not relaunch');
+    },
+    saveTargetsFn: async () => {},
+    stopRunnersForTargetFn: async () => {
+      throw new Error('should not stop');
+    },
+  });
+
+  try {
+    const result = await requestJson(baseUrl, '/api/targets/fleet-a', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runnersCount: 2 }),
+    });
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body.scaled, {
+      previousRunnersCount: 2,
+      runnersCount: 2,
+    });
+    assert.deepEqual(result.body.results, []);
+  } finally {
+    clearStatusSnapshotCache();
+    server.close();
+    await once(server, 'close');
+  }
+});
+
+test('createServer falls back to the inline shell when client assets are unavailable', async () => {
+  const originalExistsSync = fs.existsSync;
+  fs.existsSync = (candidate) => (
+    String(candidate).includes(path.join('frontend', 'dist', 'index.html'))
+      ? false
+      : originalExistsSync(candidate)
+  );
+
+  const { server, baseUrl } = await startTestServer([]);
+
+  try {
+    const response = await fetch(`${baseUrl}/dashboard`);
+    const html = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(html, /<div id="root"><\/div>/);
+  } finally {
+    fs.existsSync = originalExistsSync;
     server.close();
     await once(server, 'close');
   }

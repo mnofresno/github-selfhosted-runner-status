@@ -175,6 +175,24 @@ export function TargetCard({ target, busy, onBusyChange, onStatusChange, onRefre
     }
   }
 
+  async function updateRunnersCount(nextRunnersCount: number) {
+    if (nextRunnersCount === target.runnersCount || nextRunnersCount < 1) {
+      return;
+    }
+
+    onBusyChange(true);
+    onStatusChange(`Updating ${target.id} capacity to ${nextRunnersCount} runner${nextRunnersCount === 1 ? '' : 's'}...`);
+    try {
+      await api.updateTarget(target.id, { runnersCount: nextRunnersCount });
+      await onRefresh();
+      onStatusChange(`Runner capacity updated to ${nextRunnersCount}.`);
+    } catch (error) {
+      onStatusChange(`Failed: ${(error as Error).message}`);
+    } finally {
+      onBusyChange(false);
+    }
+  }
+
   const resources = summarizeRunnerResources(target);
 
   return (
@@ -194,7 +212,25 @@ export function TargetCard({ target, busy, onBusyChange, onStatusChange, onRefre
       <div className="summary-strip">
         <div>
           <span className="summary-label">Runners</span>
-          <strong>{running}/{target.runnersCount}</strong>
+          <div className="runner-capacity-control">
+            <button
+              type="button"
+              aria-label="Decrease runners"
+              disabled={busy || target.runnersCount <= 1}
+              onClick={() => void updateRunnersCount(target.runnersCount - 1)}
+            >
+              -
+            </button>
+            <strong>{running}/{target.runnersCount}</strong>
+            <button
+              type="button"
+              aria-label="Increase runners"
+              disabled={busy}
+              onClick={() => void updateRunnersCount(target.runnersCount + 1)}
+            >
+              +
+            </button>
+          </div>
         </div>
         <div>
           <span className="summary-label">Registered</span>

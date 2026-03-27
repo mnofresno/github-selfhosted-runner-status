@@ -119,6 +119,11 @@ function parseLabels(value) {
   return String(value || '').split(',').map((i) => i.trim()).filter(Boolean);
 }
 
+function normalizeRunnersCount(value, fallback = DEFAULT_RUNNERS_PER_TARGET) {
+  const parsed = Number.parseInt(String(value ?? fallback).trim(), 10);
+  return Math.max(1, Number.isNaN(parsed) ? fallback : parsed);
+}
+
 function parseListenPort(value) {
   const c = String(value || '').trim();
   return /^\d+$/.test(c) ? Number.parseInt(c, 10) : DEFAULT_PORT;
@@ -462,7 +467,7 @@ function normalizeTarget(input, env = process.env) {
   const id = slugify(input.id || input.name || derivedName || `target-${Date.now()}`);
   const token = input.accessToken || env.ACCESS_TOKEN || '';
   const labels = parseLabels(input.labels || env.LABELS || 'self-hosted,linux,x64');
-  const runnersCount = Math.max(1, Number.parseInt(input.runnersCount || input.runners || DEFAULT_RUNNERS_PER_TARGET, 10) || 1);
+  const runnersCount = normalizeRunnersCount(input.runnersCount || input.runners || DEFAULT_RUNNERS_PER_TARGET);
   const image = input.runnerImage || env.RUNNER_IMAGE || DEFAULT_RUNNER_IMAGE;
   const workdir = input.runnerWorkdir || env.RUNNER_WORKDIR || DEFAULT_WORKDIR;
   const dindImage = input.dindImage || env.DIND_IMAGE || DEFAULT_DIND_IMAGE;
@@ -584,6 +589,23 @@ function validateTargetFormInput(input) {
     valid: errors.length === 0,
     errors,
   };
+}
+
+function validateTargetRunnersCountInput(input) {
+  const raw = String(input?.runnersCount ?? '').trim();
+  if (!raw) {
+    return { valid: false, error: 'Runners Count is required.' };
+  }
+  if (!/^\d+$/.test(raw)) {
+    return { valid: false, error: 'Runners Count must be a whole number.' };
+  }
+
+  const runnersCount = Number.parseInt(raw, 10);
+  if (runnersCount < 1) {
+    return { valid: false, error: 'Runners Count must be at least 1.' };
+  }
+
+  return { valid: true, runnersCount };
 }
 
 /* c8 ignore start */
@@ -812,8 +834,8 @@ async function ensureAllRunners(targets) {
   return all;
 }
 
-async function stopRunnersForTarget(targetId, runnersCount) {
-  for (let i = 0; i < runnersCount; i++) {
+async function stopRunnersForTarget(targetId, runnersCount, startIndex = 0) {
+  for (let i = startIndex; i < runnersCount; i++) {
     await removeStack(stackId(targetId, i)).catch(() => {});
   }
 }
@@ -1022,6 +1044,57 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
     res.status(201).json(sanitizeTargetForClient(target));
   }));
 
+  app.patch('/api/targets/:targetId', asyncRoute(async (req, res) => {
+    const target = resolveTarget(req.params.targetId);
+    if (!target) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+
+    const validation = validateTargetRunnersCountInput(req.body || {});
+    if (!validation.valid) {
+      res.status(400).json({ error: validation.error });
+      return;
+    }
+
+    const previousRunnersCount = target.runnersCount;
+    const nextRunnersCount = validation.runnersCount;
+    if (previousRunnersCount === nextRunnersCount) {
+      res.json({
+        target: sanitizeTargetForClient(target),
+        scaled: {
+          previousRunnersCount,
+          runnersCount: nextRunnersCount,
+        },
+        results: [],
+      });
+      return;
+    }
+
+    target.runnersCount = nextRunnersCount;
+    saveTargetsFn(targets);
+    clearStatusSnapshotCache();
+    clearGithubStatusCache();
+
+    let results = [];
+    if (nextRunnersCount > previousRunnersCount) {
+      results = await ensureRunnersForTargetFn(target);
+    } else {
+      await stopRunnersForTargetFn(target.id, previousRunnersCount, nextRunnersCount);
+    }
+
+    clearStatusSnapshotCache();
+    clearGithubStatusCache();
+    res.json({
+      target: sanitizeTargetForClient(target),
+      scaled: {
+        previousRunnersCount,
+        runnersCount: nextRunnersCount,
+      },
+      results,
+    });
+  }));
+
   app.delete('/api/targets/:targetId', asyncRoute(async (req, res) => {
     const target = resolveTarget(req.params.targetId);
     if (!target) {
@@ -1215,9 +1288,9 @@ if (require.main === module) {
 /* c8 ignore stop */
 
 module.exports = {
-  createServer, loadTargets, normalizeTarget, parseLabels, parseListenPort,
+  createServer, loadTargets, normalizeTarget, normalizeRunnersCount, parseLabels, parseListenPort,
   slugify, targetHasRepoFeed, normalizeAutocompleteItems, normalizeAccessibleOwners, resolveAutocompleteToken,
-  validateTargetFormInput, buildAutocompleteCacheKey, readAutocompleteCache,
+  validateTargetFormInput, validateTargetRunnersCountInput, buildAutocompleteCacheKey, readAutocompleteCache,
   writeAutocompleteCache, withAutocompleteCache, clearAutocompleteCache,
   readGithubStatusCache, writeGithubStatusCache, clearGithubStatusCache, githubCached,
   readRunnerResourceCache, writeRunnerResourceCache, clearRunnerResourceCache,

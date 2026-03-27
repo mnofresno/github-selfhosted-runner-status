@@ -71,3 +71,7 @@ export type TargetFormPayload = {
   runnerGroup?: string;
   description?: string;
 };
+
+export type TargetUpdatePayload = {
+  runnersCount: number;
+};

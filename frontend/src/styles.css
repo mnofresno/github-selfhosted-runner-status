@@ -244,6 +244,17 @@ h3 {
   background: var(--surface-muted);
 }
 
+.runner-capacity-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.runner-capacity-control button {
+  min-width: 34px;
+  padding: 6px 10px;
+}
+
 .summary-label {
   display: block;
   color: var(--muted);

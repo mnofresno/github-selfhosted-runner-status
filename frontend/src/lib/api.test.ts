@@ -33,6 +33,7 @@ describe('api', () => {
 
     await api.addTarget({ name: 'A', scope: 'org', owner: 'octo', labels: 'self-hosted', runnersCount: 1 });
     await api.removeTarget('fleet-a');
+    await api.updateTarget('fleet-a', { runnersCount: 3 });
     await api.getOwners('fleet-a', 'oc');
     await api.getRepos('fleet-a', 'octo', 'we');
     await api.getJobs('fleet-a', 101);
@@ -43,6 +44,7 @@ describe('api', () => {
 
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       '/api/targets',
+      '/api/targets/fleet-a',
       '/api/targets/fleet-a',
       '/api/github/owners?targetId=fleet-a&q=oc',
       '/api/github/repos?owner=octo&targetId=fleet-a&q=we',

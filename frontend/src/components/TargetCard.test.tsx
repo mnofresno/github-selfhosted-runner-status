@@ -10,6 +10,7 @@ vi.mock('../lib/api', () => ({
     getJobs: vi.fn(),
     removeTarget: vi.fn(),
     restartTarget: vi.fn(),
+    updateTarget: vi.fn(),
     rerunRun: vi.fn(),
     rerunFailed: vi.fn(),
     rerunJob: vi.fn(),
@@ -51,6 +52,7 @@ describe('TargetCard', () => {
     (api.getJobs as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (api.removeTarget as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     (api.restartTarget as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    (api.updateTarget as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     (api.rerunRun as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     (api.rerunFailed as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     (api.rerunJob as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
@@ -98,6 +100,26 @@ describe('TargetCard', () => {
     expect(api.cancelRun).toHaveBeenCalledWith('fleet-a', 102);
     expect(api.rerunRun).toHaveBeenCalledWith('fleet-a', 101);
     expect(api.rerunFailed).toHaveBeenCalledWith('fleet-a', 101);
+  });
+
+  it('persists runner capacity changes from the target card', async () => {
+    const user = userEvent.setup();
+    render(
+      <TargetCard
+        target={{ ...baseTarget, runnersCount: 2 }}
+        busy={false}
+        onBusyChange={onBusyChange}
+        onStatusChange={onStatusChange}
+        onRefresh={onRefresh}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Increase runners' }));
+    await user.click(screen.getByRole('button', { name: 'Decrease runners' }));
+
+    expect(api.updateTarget).toHaveBeenNthCalledWith(1, 'fleet-a', { runnersCount: 3 });
+    expect(api.updateTarget).toHaveBeenNthCalledWith(2, 'fleet-a', { runnersCount: 1 });
+    expect(onRefresh).toHaveBeenCalledTimes(2);
   });
 
   it('loads jobs and reruns a job from the jobs panel', async () => {
