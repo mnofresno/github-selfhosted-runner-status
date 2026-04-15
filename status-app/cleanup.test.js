@@ -1,6 +1,14 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { buildCleanupPlan, shouldRunCleanup } = require('./cleanup');
+const {
+  buildCleanupPlan,
+  createCleanupRuntime,
+  executeFleetCleanupPlan,
+  getCleanupStatus,
+  parseDurationMs,
+  shouldRunCleanup,
+  withCleanupLock,
+} = require('./cleanup');
 
 test('cleanup runs when runner fleet is idle', () => {
   const result = shouldRunCleanup({
@@ -20,6 +28,11 @@ test('cleanup runs when runner fleet is idle', () => {
 
   assert.equal(result.ok, true);
   assert.equal(result.reason, 'runner-idle');
+});
+
+test('parseDurationMs supports numeric strings and suffixed durations', () => {
+  assert.equal(parseDurationMs('1500', 1), 1500);
+  assert.equal(parseDurationMs('15m', 1), 15 * 60 * 1000);
 });
 
 test('cleanup skips while a run is active', () => {
@@ -118,4 +131,45 @@ test('cleanup plan collects stale managed stacks with no running containers', ()
   assert.deepEqual(plan.staleManagedStacks[0].volumeNames, ['volume-old']);
   assert.deepEqual(plan.staleManagedStacks[0].networkNames, ['network-old']);
   assert.equal(plan.staleManagedStacks[0].runnerName, 'old-runner');
+});
+
+test('executeFleetCleanupPlan removes stale stacks and reconciles targets', async () => {
+  const calls = [];
+  const result = await executeFleetCleanupPlan({
+    plan: {
+      staleManagedStacks: [{ stackId: 'stack-a' }],
+    },
+    removeStack: async (stackId) => {
+      calls.push(['removeStack', stackId]);
+    },
+    reconcileTargets: [{ id: 'fleet-a' }],
+    ensureRunnersForTarget: async (target) => {
+      calls.push(['reconcile', target.id]);
+      return [{ action: 'launched' }];
+    },
+  });
+
+  assert.deepEqual(calls, [
+    ['removeStack', 'stack-a'],
+    ['reconcile', 'fleet-a'],
+  ]);
+  assert.equal(result.removedStacks.length, 1);
+  assert.equal(result.reconciledTargets.length, 1);
+  assert.equal(result.errors.length, 0);
+});
+
+test('cleanup runtime exposes state snapshots and lock behavior', async () => {
+  const runtime = createCleanupRuntime();
+  runtime.fleet.running = true;
+  runtime.fleet.lastRunAt = 1234;
+  runtime.fleet.lastResult = { ok: true };
+
+  const snapshot = getCleanupStatus(runtime);
+  assert.equal(snapshot.fleet.running, true);
+  assert.equal(snapshot.fleet.lastRunAt, 1234);
+  assert.deepEqual(snapshot.fleet.lastResult, { ok: true });
+
+  runtime.maintenanceRunning = true;
+  const locked = await withCleanupLock(runtime, async () => ({ ok: true }));
+  assert.deepEqual(locked, { skipped: true, reason: 'maintenance-running' });
 });

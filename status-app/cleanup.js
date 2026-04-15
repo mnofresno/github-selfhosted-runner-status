@@ -1,6 +1,4 @@
 const DEFAULT_CLEANUP_COOLDOWN_MS = Number(process.env.CLEANUP_COOLDOWN_MS || 15 * 60 * 1000);
-const DEFAULT_DANGLING_MAX_AGE = process.env.CLEANUP_DANGLING_MAX_AGE || '24h';
-const DEFAULT_BUILD_CACHE_MAX_AGE = process.env.CLEANUP_BUILD_CACHE_MAX_AGE || '24h';
 const DEFAULT_STALE_RESOURCE_MAX_AGE = process.env.STACK_GRACE_MS || '30m';
 const MANAGED_LABEL = 'io.github-runner-fleet.managed';
 const MANAGED_STACK_LABEL = 'io.github-runner-fleet.stack-id';
@@ -9,6 +7,9 @@ const MANAGED_TARGET_LABEL = 'io.github-runner-fleet.target-id';
 
 function parseDurationMs(value, fallbackMs) {
   const candidate = String(value || '').trim();
+  if (/^\d+$/.test(candidate)) {
+    return Number.parseInt(candidate, 10);
+  }
   const match = candidate.match(/^(\d+)(ms|s|m|h|d)$/i);
   if (!match) {
     return fallbackMs;
@@ -165,26 +166,101 @@ function buildCleanupPlan({
   return { staleManagedStacks };
 }
 
-async function pruneDanglingResources(docker) {
-  const imageFilters = encodeURIComponent(JSON.stringify({ dangling: { true: true }, until: { [DEFAULT_DANGLING_MAX_AGE]: true } }));
-  const buildFilters = encodeURIComponent(JSON.stringify({ until: { [DEFAULT_BUILD_CACHE_MAX_AGE]: true } }));
+function buildCleanupState() {
+  return {
+    running: false,
+    lastRunAt: 0,
+    lastResult: null,
+    lastError: null,
+    lastStartedAt: null,
+  };
+}
 
-  const [images, volumes, buildCache] = await Promise.all([
-    docker(`/images/prune?filters=${imageFilters}`, { method: 'POST' }),
-    docker('/volumes/prune', { method: 'POST' }),
-    docker(`/build/prune?filters=${buildFilters}`, { method: 'POST' }),
-  ]);
+function snapshotCleanupState(state) {
+  return {
+    running: state.running,
+    lastRunAt: state.lastRunAt,
+    lastResult: state.lastResult,
+    lastError: state.lastError,
+    lastStartedAt: state.lastStartedAt,
+  };
+}
+
+function createCleanupRuntime() {
+  return {
+    maintenanceRunning: false,
+    fleet: buildCleanupState(),
+  };
+}
+
+function getCleanupStatus(runtime) {
+  return {
+    maintenanceRunning: runtime.maintenanceRunning,
+    fleet: snapshotCleanupState(runtime.fleet),
+  };
+}
+
+async function withCleanupLock(runtime, task) {
+  if (runtime.maintenanceRunning) {
+    return { skipped: true, reason: 'maintenance-running' };
+  }
+
+  runtime.maintenanceRunning = true;
+  try {
+    return await task();
+  } finally {
+    runtime.maintenanceRunning = false;
+  }
+}
+
+async function executeFleetCleanupPlan({
+  plan,
+  removeStack,
+  reconcileTargets = [],
+  ensureRunnersForTarget,
+}) {
+  const removedStacks = [];
+  const errors = [];
+
+  for (const stack of plan?.staleManagedStacks || []) {
+    try {
+      await removeStack(stack.stackId, stack);
+      removedStacks.push(stack);
+    } catch (error) {
+      errors.push({ stackId: stack.stackId, error: error.message });
+    }
+  }
+
+  const reconciledTargets = [];
+  if (typeof ensureRunnersForTarget === 'function') {
+    for (const target of reconcileTargets) {
+      try {
+        const result = await ensureRunnersForTarget(target);
+        reconciledTargets.push({
+          targetId: target.id,
+          results: result,
+        });
+      } catch (error) {
+        errors.push({ targetId: target.id, error: error.message });
+      }
+    }
+  }
 
   return {
-    imagePrune: images.body,
-    volumePrune: volumes.body,
-    buildCachePrune: buildCache.body,
+    removedStacks,
+    reconciledTargets,
+    errors,
   };
 }
 
 module.exports = {
+  buildCleanupState,
   buildCleanupPlan,
+  createCleanupRuntime,
+  executeFleetCleanupPlan,
+  getCleanupStatus,
   parseDurationMs,
   shouldRunCleanup,
-  pruneDanglingResources,
+  snapshotCleanupState,
+  withCleanupLock,
 };

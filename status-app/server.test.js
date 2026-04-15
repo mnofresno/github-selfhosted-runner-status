@@ -1,8 +1,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { once } = require('node:events');
 
 const {
   buildRunnerContainerSpec,
+  createServer,
   desiredRunnerCountForTarget,
   groupManagedStacks,
   githubCacheGet,
@@ -14,6 +16,18 @@ const {
   parseRepoUrl,
   shouldRemoveManagedStack,
 } = require('./server');
+
+async function requestJson(baseUrl, path, init = {}) {
+  const response = await fetch(`${baseUrl}${path}`, init);
+  const text = await response.text();
+  let body = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = text;
+  }
+  return { response, body };
+}
 
 test('parseRepoUrl extracts owner and repo', () => {
   assert.deepEqual(parseRepoUrl('https://github.com/bpf-project/bpf-application.git'), {
@@ -221,4 +235,49 @@ test('parseListenPort ignores host bind strings and keeps internal default', () 
   assert.equal(parseListenPort('3571'), 3571);
   assert.equal(parseListenPort('127.0.0.1:3571'), 8080);
   assert.equal(parseListenPort(''), 8080);
+});
+
+test('createServer exposes fleet cleanup admin routes and status snapshots', async () => {
+  const fleetCleanupResult = {
+    mode: 'fleet',
+    startedAt: '2026-04-15T12:00:00.000Z',
+    finishedAt: '2026-04-15T12:01:00.000Z',
+    durationMs: 60000,
+    plan: { staleManagedStacks: [], ignoredResources: [] },
+    removedStacks: [],
+    reconciledTargets: [],
+    errors: [],
+  };
+
+  const server = createServer([], {
+    runFleetCleanupFn: async () => fleetCleanupResult,
+    getCleanupStatusFn: () => ({
+      maintenanceRunning: false,
+      fleet: {
+        running: false,
+        lastRunAt: fleetCleanupResult.finishedAt,
+        lastStartedAt: fleetCleanupResult.startedAt,
+        lastResult: fleetCleanupResult,
+        lastError: null,
+      },
+    }),
+  });
+
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const { port } = server.address();
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  try {
+    let result = await requestJson(baseUrl, '/api/admin/cleanup/status');
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body.fleet.lastResult, fleetCleanupResult);
+
+    result = await requestJson(baseUrl, '/api/admin/cleanup/fleet', { method: 'POST' });
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body, fleetCleanupResult);
+  } finally {
+    server.close();
+    await once(server, 'close');
+  }
 });

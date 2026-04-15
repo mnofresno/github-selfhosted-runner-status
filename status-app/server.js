@@ -1,14 +1,27 @@
 const http = require('http');
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
 const { URL } = require('url');
+const {
+  buildCleanupPlan,
+  createCleanupRuntime,
+  executeFleetCleanupPlan,
+  getCleanupStatus,
+  shouldRunCleanup,
+  withCleanupLock,
+} = require('./cleanup');
 
 const DEFAULT_PORT = 8080;
 const DEFAULT_WORKDIR = '/tmp/github-runner';
 const DEFAULT_DIND_IMAGE = 'docker:27-dind';
 const DEFAULT_RECONCILE_INTERVAL_MS = Number.parseInt(process.env.RECONCILE_INTERVAL_MS || '5000', 10);
+const CLEANUP_ENABLED = String(process.env.CLEANUP_ENABLED || 'true').toLowerCase() !== 'false';
+const CLEANUP_INTERVAL_MS = Math.max(60_000, Number.parseInt(process.env.CLEANUP_INTERVAL_MS || '3600000', 10));
 const DEFAULT_STACK_GRACE_MS = Number.parseInt(process.env.STACK_GRACE_MS || '30000', 10);
 const DEFAULT_MAX_RUNNERS_PER_TARGET = Math.max(1, Number.parseInt(process.env.MAX_RUNNERS_PER_TARGET || '2', 10));
 const GITHUB_API_CACHE_MS = Math.max(0, Number.parseInt(process.env.GITHUB_API_CACHE_MS || '300000', 10));
+let cleanupRuntime = createCleanupRuntime();
 const githubApiCache = new Map();
 
 function githubCacheKey(token, path) {
@@ -1127,7 +1140,7 @@ function createReconciler(targets) {
   let running = false;
 
   async function reconcileOnce() {
-    if (running) {
+    if (running || cleanupRuntime.maintenanceRunning) {
       return { skipped: true };
     }
 
@@ -1172,6 +1185,109 @@ function createReconciler(targets) {
 
 async function getTargetStatus(target, allStacks = null) {
   return collectTargetSnapshot(target, allStacks);
+}
+
+function snapshotCleanupStatus() {
+  return getCleanupStatus(cleanupRuntime);
+}
+
+function resetCleanupRuntime() {
+  cleanupRuntime = createCleanupRuntime();
+}
+
+async function runFleetCleanup(targets, options = {}) {
+  const {
+    getStatusFn = getStatus,
+    ensureRunnersForTargetFn = ensureRunnersForTarget,
+  } = options;
+
+  return withCleanupLock(cleanupRuntime, async () => {
+    const startedAt = new Date().toISOString();
+    const status = await getStatusFn(targets);
+    const cleanupDecision = shouldRunCleanup({
+      status,
+      cleanupState: cleanupRuntime.fleet,
+      now: Date.now(),
+    });
+
+    if (!cleanupDecision.ok) {
+      const skippedResult = {
+        mode: 'fleet',
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        skipped: true,
+        reason: cleanupDecision.reason,
+      };
+      cleanupRuntime.fleet.lastResult = skippedResult;
+      cleanupRuntime.fleet.lastRunAt = Date.now();
+      return skippedResult;
+    }
+
+    cleanupRuntime.fleet.running = true;
+    cleanupRuntime.fleet.lastStartedAt = startedAt;
+    cleanupRuntime.fleet.lastError = null;
+
+    try {
+      const [dockerContainers, dockerVolumes, dockerNetworks] = await Promise.all([
+        listManagedContainers(),
+        listManagedVolumes(),
+        listManagedNetworks(),
+      ]);
+      const plan = buildCleanupPlan({
+        status,
+        dockerContainers,
+        dockerVolumes,
+        dockerNetworks,
+        now: Date.now(),
+      });
+
+      const executeResult = await executeFleetCleanupPlan({
+        plan,
+        removeStack: async (stackIdValue) => removeManagedStack(stackIdValue),
+        reconcileTargets: (targets || []).filter((target) => target.runnersCount > 0),
+        ensureRunnersForTarget: ensureRunnersForTargetFn,
+      });
+
+      const finishedAt = new Date().toISOString();
+      const result = {
+        mode: 'fleet',
+        startedAt,
+        finishedAt,
+        durationMs: Date.parse(finishedAt) - Date.parse(startedAt),
+        plan,
+        ...executeResult,
+      };
+
+      cleanupRuntime.fleet.lastRunAt = Date.now();
+      cleanupRuntime.fleet.lastResult = result;
+      return result;
+    } catch (error) {
+      const finishedAt = new Date().toISOString();
+      cleanupRuntime.fleet.lastRunAt = Date.now();
+      cleanupRuntime.fleet.lastError = error.message;
+      cleanupRuntime.fleet.lastResult = {
+        mode: 'fleet',
+        startedAt,
+        finishedAt,
+        error: error.message,
+      };
+      throw error;
+    } finally {
+      cleanupRuntime.fleet.running = false;
+    }
+  });
+}
+
+function startFleetCleanupLoop(targets) {
+  if (!CLEANUP_ENABLED) {
+    return null;
+  }
+
+  return setInterval(() => {
+    runFleetCleanup(targets).catch((error) => {
+      console.error('[runner-status] cleanup failed', error);
+    });
+  }, CLEANUP_INTERVAL_MS);
 }
 
 async function getStatus(targets) {
@@ -1748,7 +1864,10 @@ function sendHtml(res, statusCode, html) {
 }
 
 function createServer(targets = loadTargets(), options = {}) {
+  resetCleanupRuntime();
   const targetMap = getTargetMap(targets);
+  const runFleetCleanupFn = options.runFleetCleanupFn || ((currentTargets) => runFleetCleanup(currentTargets, options));
+  const getCleanupStatusFn = options.getCleanupStatusFn || snapshotCleanupStatus;
 
   return http.createServer(async (req, res) => {
     try {
@@ -1777,6 +1896,17 @@ function createServer(targets = loadTargets(), options = {}) {
       if (removeManagedMatch && req.method === 'POST') {
         const result = await removeManagedRunner(removeManagedMatch[1]);
         options.reconcileOnce?.().catch(() => {});
+        sendJson(res, 200, result);
+        return;
+      }
+
+      if (requestUrl.pathname === '/api/admin/cleanup/status' && req.method === 'GET') {
+        sendJson(res, 200, getCleanupStatusFn());
+        return;
+      }
+
+      if (requestUrl.pathname === '/api/admin/cleanup/fleet' && req.method === 'POST') {
+        const result = await runFleetCleanupFn(targets, options);
         sendJson(res, 200, result);
         return;
       }
@@ -1890,6 +2020,7 @@ if (require.main === module) {
   const targets = loadTargets();
   const reconciler = createReconciler(targets);
   reconciler.start();
+  startFleetCleanupLoop(targets);
   reconciler.reconcileOnce().catch((error) => {
     console.error('[runner-status] initial reconcile failed', error);
   });
