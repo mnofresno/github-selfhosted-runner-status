@@ -5,6 +5,14 @@ const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
 const { URL } = require('url');
+const {
+  buildFleetCleanupPlan,
+  createCleanupRuntime,
+  executeFleetCleanupPlan,
+  getCleanupStatus,
+  shouldRunCleanup,
+  withCleanupLock,
+} = require('./cleanup');
 export {};
 
 type JsonResponse = { statusCode: number; body: any };
@@ -26,6 +34,8 @@ type CreateServerOptions = {
   rerunWorkflowRunFn?: typeof rerunWorkflowRun;
   saveTargetsFn?: typeof saveTargets;
   stopRunnersForTargetFn?: typeof stopRunnersForTarget;
+  runFleetCleanupFn?: typeof runFleetCleanup;
+  getCleanupStatusFn?: typeof snapshotCleanupStatus;
 };
 
 const DEFAULT_PORT = 8080;
@@ -34,6 +44,8 @@ const DEFAULT_DIND_IMAGE = 'docker:27-dind';
 const DEFAULT_RUNNERS_PER_TARGET = Math.max(1, Number.parseInt(process.env.RUNNERS_PER_TARGET || '1', 10));
 const DEFAULT_RUNNER_IMAGE = process.env.RUNNER_IMAGE || 'myoung34/github-runner:latest';
 const HEALTHCHECK_INTERVAL_MS = Number.parseInt(process.env.HEALTHCHECK_INTERVAL_MS || '15000', 10);
+const CLEANUP_ENABLED = String(process.env.CLEANUP_ENABLED || 'true').toLowerCase() !== 'false';
+const CLEANUP_INTERVAL_MS = Math.max(60_000, Number.parseInt(process.env.CLEANUP_INTERVAL_MS || '3600000', 10));
 const DATA_DIR = process.env.DATA_DIR || '/app/data';
 const TARGETS_FILE = path.join(DATA_DIR, 'targets.json');
 const AUTOCOMPLETE_CACHE_TTL_MS = Number.parseInt(process.env.AUTOCOMPLETE_CACHE_TTL_MS || '60000', 10);
@@ -65,6 +77,11 @@ const statusSnapshotCache = {
   expiresAt: 0,
   pending: null,
 };
+let cleanupRuntime = createCleanupRuntime();
+
+function resetCleanupRuntime() {
+  cleanupRuntime = createCleanupRuntime();
+}
 
 /* ── Utilities ──────────────────────────────────────────────────────── */
 
@@ -409,6 +426,24 @@ async function listAllContainers() {
 async function listManagedContainers() {
   const all = await listAllContainers();
   return all.filter((c) => c.Labels?.[MANAGED_LABEL] === 'true');
+}
+
+async function listManagedVolumes() {
+  const filters = encodeURIComponent(JSON.stringify({ label: [`${MANAGED_LABEL}=true`] }));
+  const response = await docker(`/volumes?filters=${filters}`);
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(`Volume list failed: ${response.statusCode}`);
+  }
+  return response.body?.Volumes || [];
+}
+
+async function listManagedNetworks() {
+  const filters = encodeURIComponent(JSON.stringify({ label: [`${MANAGED_LABEL}=true`] }));
+  const response = await docker(`/networks?filters=${filters}`);
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(`Network list failed: ${response.statusCode}`);
+  }
+  return response.body || [];
 }
 
 async function inspectContainer(containerId) {
@@ -757,21 +792,59 @@ async function launchRunnerStack(target, index) {
   }
 }
 
+async function stopManagedRunnerGracefully(containerId, timeoutMs = 15_000) {
+  const timeoutSeconds = Math.max(1, Math.ceil(timeoutMs / 1000));
+  const response = await docker(`/containers/${containerId}/stop?t=${timeoutSeconds}`, { method: 'POST' });
+  if (response.statusCode === 404) {
+    return { status: 'missing' };
+  }
+  if (response.statusCode === 304) {
+    return { status: 'already-stopped' };
+  }
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(`Container stop failed: ${response.statusCode}`);
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const inspect = await docker(`/containers/${containerId}/json`);
+    if (inspect.statusCode === 404 || inspect.body?.State?.Running === false) {
+      return { status: 'stopped' };
+    }
+    await sleep(1000);
+  }
+
+  return { status: 'timeout' };
+}
+
 async function removeStack(sId) {
   const containers = await listManagedContainers();
   const matching = containers.filter((c) => c.Labels?.[MANAGED_STACK_LABEL] === sId);
+  const runnerContainer = matching.find((c) => c.Labels?.[MANAGED_ROLE_LABEL] === 'runner') || null;
+
+  if (runnerContainer) {
+    try {
+      await stopManagedRunnerGracefully(runnerContainer.Id);
+      await sleep(2000);
+    } catch (error) {
+      console.warn(`[fleet] graceful runner stop failed for ${runnerContainer.Id.slice(0, 12)}: ${error.message}`);
+    }
+  }
+
   for (const c of matching) {
     runnerResourceCache.delete(c.Id);
     runnerResourceRefreshes.delete(c.Id);
     await removeContainerForce(c.Id).catch(() => {});
   }
 
-  const volResponse = await docker(`/volumes?filters=${encodeURIComponent(JSON.stringify({ label: [`${MANAGED_STACK_LABEL}=${sId}`] }))}`);
+  const volumeFilters = encodeURIComponent(JSON.stringify({ label: [`${MANAGED_STACK_LABEL}=${sId}`] }));
+  const volResponse = await docker(`/volumes?filters=${volumeFilters}`);
   for (const v of (volResponse.body?.Volumes || [])) {
     await removeVolume(v.Name).catch(() => {});
   }
 
-  const netResponse = await docker(`/networks?filters=${encodeURIComponent(JSON.stringify({ label: [`${MANAGED_STACK_LABEL}=${sId}`] }))}`);
+  const netFilters = encodeURIComponent(JSON.stringify({ label: [`${MANAGED_STACK_LABEL}=${sId}`] }));
+  const netResponse = await docker(`/networks?filters=${netFilters}`);
   for (const n of (netResponse.body || [])) {
     await removeNetwork(n.Name).catch(() => {});
   }
@@ -838,6 +911,106 @@ async function stopRunnersForTarget(targetId, runnersCount, startIndex = 0) {
   for (let i = startIndex; i < runnersCount; i++) {
     await removeStack(stackId(targetId, i)).catch(() => {});
   }
+}
+
+function snapshotCleanupStatus() {
+  return getCleanupStatus(cleanupRuntime);
+}
+
+async function listDockerCleanupResources() {
+  const [dockerContainers, dockerVolumes, dockerNetworks] = await Promise.all([
+    listManagedContainers(),
+    listManagedVolumes(),
+    listManagedNetworks(),
+  ]);
+
+  return { dockerContainers, dockerVolumes, dockerNetworks };
+}
+
+async function runFleetCleanup(targets, options: any = {}) {
+  const {
+    getStatusFn = getStatus,
+    getCachedStatusFn = getCachedStatus,
+    ensureRunnersForTargetFn = ensureRunnersForTarget,
+  } = options;
+
+  return withCleanupLock(cleanupRuntime, async () => {
+    const startedAt = new Date().toISOString();
+
+    try {
+      const status = await getCachedStatusFn(targets, getStatusFn);
+      const cleanupDecision = shouldRunCleanup({
+        status,
+        cleanupState: {
+          running: false,
+          lastRunAt: cleanupRuntime.fleet.lastRunAt,
+        },
+      });
+
+      if (!cleanupDecision.ok) {
+        const skippedResult = {
+          mode: 'fleet',
+          startedAt,
+          finishedAt: new Date().toISOString(),
+          skipped: true,
+          reason: cleanupDecision.reason,
+        };
+        cleanupRuntime.fleet.lastResult = skippedResult;
+        cleanupRuntime.fleet.lastRunAt = skippedResult.finishedAt;
+        return skippedResult;
+      }
+
+      cleanupRuntime.fleet.running = true;
+      cleanupRuntime.fleet.lastStartedAt = startedAt;
+      cleanupRuntime.fleet.lastError = null;
+
+      const { dockerContainers, dockerVolumes, dockerNetworks } = await listDockerCleanupResources();
+      const plan = buildFleetCleanupPlan({
+        status,
+        dockerContainers,
+        dockerVolumes,
+        dockerNetworks,
+        now: Date.now(),
+      });
+
+      const executeResult = await executeFleetCleanupPlan({
+        plan,
+        removeStack: async (stackIdValue) => removeStack(stackIdValue),
+        reconcileTargets: (targets || []).filter((target) => target.runnersCount > 0),
+        ensureRunnersForTarget: ensureRunnersForTargetFn,
+      });
+
+      clearStatusSnapshotCache();
+      clearGithubStatusCache();
+
+      const finishedAt = new Date().toISOString();
+      const result = {
+        mode: 'fleet',
+        startedAt,
+        finishedAt,
+        durationMs: Date.parse(finishedAt) - Date.parse(startedAt),
+        plan,
+        ...executeResult,
+      };
+
+      cleanupRuntime.fleet.lastRunAt = finishedAt;
+      cleanupRuntime.fleet.lastResult = result;
+      return result;
+    } catch (error) {
+      const finishedAt = new Date().toISOString();
+      cleanupRuntime.fleet.lastRunAt = finishedAt;
+      cleanupRuntime.fleet.lastError = error.message;
+      cleanupRuntime.fleet.lastResult = {
+        mode: 'fleet',
+        startedAt,
+        finishedAt,
+        error: error.message,
+      };
+      throw error;
+    } finally {
+      cleanupRuntime.fleet.running = false;
+    }
+  });
 }
 
 /* ── GitHub Data Fetching (for dashboard) ────────────────────────────── */
@@ -999,12 +1172,14 @@ function renderClientShellFallback() {
 }
 
 function createServer(initialTargets, options: CreateServerOptions = {}) {
+  resetCleanupRuntime();
   const app = express();
-  let targets = [...initialTargets];
+  let targets = initialTargets;
   const {
     ensureRunnersForTargetFn = ensureRunnersForTarget,
     forceCancelRunFn = forceCancelRun,
     getStatusFn = getStatus,
+    getCleanupStatusFn = snapshotCleanupStatus,
     githubOwnerSuggestionsFn = githubOwnerSuggestions,
     githubRepoSuggestionsFn = githubRepoSuggestions,
     listRunJobsFn = listRunJobs,
@@ -1013,6 +1188,7 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
     rerunWorkflowRunFn = rerunWorkflowRun,
     saveTargetsFn = saveTargets,
     stopRunnersForTargetFn = stopRunnersForTarget,
+    runFleetCleanupFn = runFleetCleanup,
   } = options;
 
   function resolveTarget(id) {
@@ -1103,7 +1279,10 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
     }
 
     await stopRunnersForTargetFn(target.id, target.runnersCount);
-    targets = targets.filter((item) => item.id !== target.id);
+    const targetIndex = targets.findIndex((item) => item.id === target.id);
+    if (targetIndex >= 0) {
+      targets.splice(targetIndex, 1);
+    }
     saveTargetsFn(targets);
     clearStatusSnapshotCache();
     clearGithubStatusCache();
@@ -1133,6 +1312,36 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
     const results = await ensureRunnersForTargetFn(target);
     clearStatusSnapshotCache();
     res.json(results);
+  }));
+
+  app.post('/api/targets/:targetId/reconcile', asyncRoute(async (req, res) => {
+    const target = resolveTarget(req.params.targetId);
+    if (!target) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+
+    const results = await ensureRunnersForTargetFn(target);
+    clearStatusSnapshotCache();
+    clearGithubStatusCache();
+    res.json(results);
+  }));
+
+  app.get('/api/admin/cleanup/status', asyncRoute(async (_req, res) => {
+    res.json(getCleanupStatusFn());
+  }));
+
+  app.post('/api/admin/cleanup/fleet', asyncRoute(async (_req, res) => {
+    try {
+      const result = await runFleetCleanupFn(targets, {
+        getStatusFn,
+        getCachedStatusFn: getCachedStatus,
+        ensureRunnersForTargetFn,
+      });
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
   }));
 
   app.get('/api/targets/:targetId/runs/:runId/jobs', asyncRoute(async (req, res) => {
@@ -1246,7 +1455,9 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
     res.status(500).json({ error: error.message });
   });
 
-  return http.createServer(app);
+  const server = http.createServer(app);
+  server.cleanupRuntime = cleanupRuntime;
+  return server;
 }
 
 /* ── Healthcheck Loop (restart crashed runners only) ─────────────── */
@@ -1254,6 +1465,9 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
 
 function startHealthcheck(targets) {
   return setInterval(async () => {
+    if (cleanupRuntime.maintenanceRunning) {
+      return;
+    }
     try {
       for (const target of targets) {
         await ensureRunnersForTarget(target);
@@ -1262,6 +1476,20 @@ function startHealthcheck(targets) {
       console.error('[fleet] healthcheck error:', error.message);
     }
   }, HEALTHCHECK_INTERVAL_MS);
+}
+
+function startFleetCleanupLoop(targets) {
+  if (!CLEANUP_ENABLED) {
+    return null;
+  }
+
+  return setInterval(async () => {
+    try {
+      await runFleetCleanup(targets);
+    } catch (error) {
+      console.error('[fleet] cleanup error:', error.message);
+    }
+  }, CLEANUP_INTERVAL_MS);
 }
 
 /* ── Entry Point ─────────────────────────────────────────────────── */
@@ -1279,9 +1507,9 @@ if (require.main === module) {
     })
     .catch((error) => console.error('[fleet] startup error:', error.message));
 
-  startHealthcheck(targets);
-
   const server = createServer(targets);
+  startHealthcheck(targets);
+  startFleetCleanupLoop(targets);
   server.listen(parseListenPort(process.env.STATUS_PORT), '0.0.0.0');
   console.log(`[fleet] dashboard listening on :${parseListenPort(process.env.STATUS_PORT)}`);
 }
@@ -1297,4 +1525,5 @@ module.exports = {
   clearStatusSnapshotCache, getCachedStatus, renderClientShellFallback,
   loadPersistedTargets, saveTargets, ensureRunnersForTarget, resolveClientDistDir,
   sanitizeStatusForClient, sanitizeTargetForClient,
+  resetCleanupRuntime, snapshotCleanupStatus, runFleetCleanup,
 };

@@ -1,6 +1,15 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { buildCleanupPlan, parseDurationMs, pruneDanglingResources, shouldRunCleanup } = require('./cleanup.ts');
+const {
+  buildCleanupPlan,
+  buildFleetCleanupPlan,
+  createCleanupRuntime,
+  executeFleetCleanupPlan,
+  getCleanupStatus,
+  parseDurationMs,
+  shouldRunCleanup,
+  withCleanupLock,
+} = require('./cleanup.ts');
 
 test('parseDurationMs supports units and falls back on invalid input', () => {
   assert.equal(parseDurationMs('15m', 1), 15 * 60 * 1000);
@@ -65,8 +74,8 @@ test('cleanup skips while a run is active', () => {
   assert.equal(result.reason, 'run-active');
 });
 
-test('cleanup plan collects stale managed stacks with no running containers', () => {
-  const plan = buildCleanupPlan({
+test('fleet cleanup plan collects stale managed stacks with no running containers', () => {
+  const plan = buildFleetCleanupPlan({
     status: {
       targets: [{
         githubRunners: [{ name: 'busy-runner', busy: true }],
@@ -143,7 +152,7 @@ test('cleanup plan collects stale managed stacks with no running containers', ()
   assert.equal(plan.staleManagedStacks[0].runnerName, 'old-runner');
 });
 
-test('cleanup plan ignores unmanaged, active, and recent stacks', () => {
+test('fleet cleanup plan ignores unmanaged, active, and recent stacks', () => {
   const now = Date.now();
   const labels = {
     'io.github-runner-fleet.managed': 'true',
@@ -152,7 +161,7 @@ test('cleanup plan ignores unmanaged, active, and recent stacks', () => {
     'io.github-runner-fleet.target-id': 'gymnerd-org',
   };
 
-  const plan = buildCleanupPlan({
+  const plan = buildFleetCleanupPlan({
     status: {
       targets: [{
         githubRunners: [{ name: 'busy-runner', busy: true }],
@@ -190,7 +199,7 @@ test('cleanup plan ignores unmanaged, active, and recent stacks', () => {
   assert.deepEqual(plan.staleManagedStacks, []);
 });
 
-test('cleanup plan keeps the oldest resource timestamp for managed volumes and networks', () => {
+test('fleet cleanup plan keeps the oldest resource timestamp for managed volumes and networks', () => {
   const now = Date.now();
   const labels = {
     'io.github-runner-fleet.managed': 'true',
@@ -202,7 +211,7 @@ test('cleanup plan keeps the oldest resource timestamp for managed volumes and n
   const olderIso = new Date(now - (90 * 60 * 1000)).toISOString();
   const newerIso = new Date(now - (60 * 60 * 1000)).toISOString();
 
-  const plan = buildCleanupPlan({
+  const plan = buildFleetCleanupPlan({
     status: { targets: [] },
     dockerContainers: [
       { Id: 'container-oldest', Created: Math.floor((now - (30 * 60 * 1000)) / 1000), State: 'exited', Labels: labels },
@@ -223,23 +232,79 @@ test('cleanup plan keeps the oldest resource timestamp for managed volumes and n
   assert.deepEqual(plan.staleManagedStacks[0].networkNames, ['older-network', 'newer-network']);
 });
 
-test('pruneDanglingResources requests image, volume and build cache pruning', async () => {
+test('fleet cleanup plan skips resources with incomplete labels', () => {
+  const plan = buildFleetCleanupPlan({
+    status: { targets: [] },
+    dockerContainers: [
+      {
+        Id: 'partial-label-container',
+        Created: Math.floor((Date.now() - (45 * 60 * 1000)) / 1000),
+        State: 'exited',
+        Labels: {
+          'io.github-runner-fleet.managed': 'true',
+          'io.github-runner-fleet.stack-id': 'stack-partial',
+        },
+      },
+    ],
+  });
+
+  assert.equal(plan.staleManagedStacks.length, 1);
+  assert.equal(plan.ignoredResources.length, 1);
+  assert.equal(plan.ignoredResources[0].reason, 'incomplete-labels');
+});
+
+test('executeFleetCleanupPlan removes stale stacks and reconciles targets', async () => {
   const calls = [];
-  const docker = async (path, options) => {
-    calls.push({ path, options });
-    return { body: { path } };
+  const plan = {
+    staleManagedStacks: [
+      {
+        stackId: 'stack-a',
+        targetId: 'fleet-a',
+        runnerName: 'runner-a',
+        createdMs: Date.now() - (60 * 60 * 1000),
+        ageMs: 60 * 60 * 1000,
+        targetConfigured: true,
+        containerIds: ['container-a'],
+        volumeNames: ['volume-a'],
+        networkNames: ['network-a'],
+        labelCompleteness: { managed: true, targetId: true, runnerName: true, stackId: true },
+      },
+    ],
   };
 
-  const result = await pruneDanglingResources(docker);
-
-  assert.equal(calls.length, 3);
-  assert.match(calls[0].path, /^\/images\/prune\?filters=/);
-  assert.deepEqual(calls[0].options, { method: 'POST' });
-  assert.deepEqual(calls[1], { path: '/volumes/prune', options: { method: 'POST' } });
-  assert.match(calls[2].path, /^\/build\/prune\?filters=/);
-  assert.deepEqual(result, {
-    imagePrune: { path: calls[0].path },
-    volumePrune: { path: '/volumes/prune' },
-    buildCachePrune: { path: calls[2].path },
+  const result = await executeFleetCleanupPlan({
+    plan,
+    removeStack: async (stackId) => {
+      calls.push(['removeStack', stackId]);
+    },
+    reconcileTargets: [{ id: 'fleet-a' }],
+    ensureRunnersForTarget: async (target) => {
+      calls.push(['reconcile', target.id]);
+      return [{ action: 'launched' }];
+    },
   });
+
+  assert.deepEqual(calls, [
+    ['removeStack', 'stack-a'],
+    ['reconcile', 'fleet-a'],
+  ]);
+  assert.equal(result.removedStacks.length, 1);
+  assert.equal(result.reconciledTargets.length, 1);
+  assert.equal(result.errors.length, 0);
+});
+
+test('cleanup runtime exposes state snapshots and lock behavior', async () => {
+  const runtime = createCleanupRuntime();
+  runtime.fleet.running = true;
+  runtime.fleet.lastRunAt = 1234;
+  runtime.fleet.lastResult = { ok: true };
+
+  const snapshot = getCleanupStatus(runtime);
+  assert.equal(snapshot.fleet.running, true);
+  assert.equal(snapshot.fleet.lastRunAt, 1234);
+  assert.deepEqual(snapshot.fleet.lastResult, { ok: true });
+
+  runtime.maintenanceRunning = true;
+  const locked = await withCleanupLock(runtime, async () => ({ ok: true }));
+  assert.deepEqual(locked, { skipped: true, reason: 'maintenance-running' });
 });

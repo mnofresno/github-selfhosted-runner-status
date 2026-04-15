@@ -1,8 +1,6 @@
-const DEFAULT_CLEANUP_COOLDOWN_MS = Number(process.env.CLEANUP_COOLDOWN_MS || 15 * 60 * 1000);
-export {};
-const DEFAULT_DANGLING_MAX_AGE = process.env.CLEANUP_DANGLING_MAX_AGE || '24h';
-const DEFAULT_BUILD_CACHE_MAX_AGE = process.env.CLEANUP_BUILD_CACHE_MAX_AGE || '24h';
+const DEFAULT_CLEANUP_COOLDOWN_MS = Number.parseInt(process.env.CLEANUP_COOLDOWN_MS || `${15 * 60 * 1000}`, 10);
 const DEFAULT_STALE_RESOURCE_MAX_AGE = process.env.STACK_GRACE_MS || '30m';
+
 const MANAGED_LABEL = 'io.github-runner-fleet.managed';
 const MANAGED_STACK_LABEL = 'io.github-runner-fleet.stack-id';
 const MANAGED_RUNNER_LABEL = 'io.github-runner-fleet.runner-name';
@@ -10,6 +8,14 @@ const MANAGED_TARGET_LABEL = 'io.github-runner-fleet.target-id';
 
 function parseDurationMs(value, fallbackMs) {
   const candidate = String(value || '').trim();
+  if (!candidate) {
+    return fallbackMs;
+  }
+
+  if (/^\d+$/.test(candidate)) {
+    return Number.parseInt(candidate, 10);
+  }
+
   const match = candidate.match(/^(\d+)(ms|s|m|h|d)$/i);
   if (!match) {
     return fallbackMs;
@@ -28,30 +34,6 @@ function parseDurationMs(value, fallbackMs) {
   return amount * multiplier;
 }
 
-function shouldRunCleanup({ status, cleanupState, now = Date.now() }) {
-  if (!status || !Array.isArray(status.targets)) {
-    return { ok: false, reason: 'runner-missing' };
-  }
-
-  const hasBusyRunner = status.targets.some((target) => (
-    (target.githubRunners || []).some((runner) => runner.busy)
-    || (target.activeRuns || []).length > 0
-    || (target.activeJobs || []).length > 0
-  ));
-
-  if (hasBusyRunner) {
-    return { ok: false, reason: 'run-active' };
-  }
-  if (cleanupState.running) {
-    return { ok: false, reason: 'cleanup-running' };
-  }
-  if (cleanupState.lastRunAt && now - cleanupState.lastRunAt < DEFAULT_CLEANUP_COOLDOWN_MS) {
-    return { ok: false, reason: 'cooldown-active' };
-  }
-
-  return { ok: true, reason: 'runner-idle' };
-}
-
 function parseCreatedMs(value) {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value > 1e12 ? value : value * 1000;
@@ -67,125 +49,330 @@ function parseCreatedMs(value) {
   return 0;
 }
 
-function buildCleanupPlan({
+function normalizeLabels(labels = {}) {
+  return labels && typeof labels === 'object' ? labels : {};
+}
+
+function getStackId(labels, fallbackId) {
+  return labels?.[MANAGED_STACK_LABEL] || labels?.[MANAGED_RUNNER_LABEL] || fallbackId || '';
+}
+
+function getManagedStackKey(labels, fallbackId) {
+  return [
+    labels?.[MANAGED_TARGET_LABEL] || '',
+    labels?.[MANAGED_STACK_LABEL] || '',
+    labels?.[MANAGED_RUNNER_LABEL] || '',
+    fallbackId || '',
+  ].join('::');
+}
+
+function hasManagedLabelSet(labels) {
+  return labels?.[MANAGED_LABEL] === 'true';
+}
+
+function isManagedResource(labels) {
+  return hasManagedLabelSet(labels);
+}
+
+function isManagedRunnerResource(labels) {
+  if (labels?.[MANAGED_LABEL] === 'true') {
+    return labels?.[MANAGED_RUNNER_LABEL] ? true : labels?.[MANAGED_STACK_LABEL] ? true : false;
+  }
+  return false;
+}
+
+function shouldRunCleanup({ status, cleanupState, now = Date.now() }) {
+  if (!status || !Array.isArray(status.targets)) {
+    return { ok: false, reason: 'runner-missing' };
+  }
+
+  const hasBusyRunner = status.targets.some((target) => (
+    (target.githubRunners || []).some((runner) => runner.busy)
+    || (target.activeRuns || []).length > 0
+    || (target.activeJobs || []).length > 0
+  ));
+
+  if (hasBusyRunner) {
+    return { ok: false, reason: 'run-active' };
+  }
+  if (cleanupState?.running) {
+    return { ok: false, reason: 'cleanup-running' };
+  }
+  const lastRunAtMs = typeof cleanupState?.lastRunAt === 'string'
+    ? Date.parse(cleanupState.lastRunAt)
+    : cleanupState?.lastRunAt;
+  if (lastRunAtMs && now - lastRunAtMs < DEFAULT_CLEANUP_COOLDOWN_MS) {
+    return { ok: false, reason: 'cooldown-active' };
+  }
+
+  return { ok: true, reason: 'runner-idle' };
+}
+
+function indexTargets(status) {
+  return new Map((status?.targets || []).map((target) => [target.id, target]));
+}
+
+function mergeStackEntry(stacks, labels, fallbackId, createdMs, kind, name, extra = {}) {
+  const stackId = getStackId(labels, fallbackId);
+  const key = getManagedStackKey(labels, stackId || fallbackId);
+  const existing = stacks.get(key);
+  const entry = existing || {
+    stackId,
+    targetId: labels?.[MANAGED_TARGET_LABEL] || '',
+    runnerName: labels?.[MANAGED_RUNNER_LABEL] || '',
+    createdMs: 0,
+    containerIds: [],
+    volumeNames: [],
+    networkNames: [],
+    labels: normalizeLabels(labels),
+    labelCompleteness: {
+      managed: isManagedResource(labels),
+      targetId: Boolean(labels?.[MANAGED_TARGET_LABEL]),
+      runnerName: Boolean(labels?.[MANAGED_RUNNER_LABEL]),
+      stackId: Boolean(labels?.[MANAGED_STACK_LABEL]),
+    },
+    ...extra,
+  };
+
+  if (createdMs && (!entry.createdMs || createdMs < entry.createdMs)) {
+    entry.createdMs = createdMs;
+  }
+
+  if (kind === 'container' && name) {
+    entry.containerIds.push(name);
+  } else if (kind === 'volume' && name) {
+    entry.volumeNames.push(name);
+  } else if (kind === 'network' && name) {
+    entry.networkNames.push(name);
+  }
+
+  stacks.set(key, entry);
+  return entry;
+}
+
+function buildFleetCleanupPlan({
   status,
   dockerContainers = [],
   dockerVolumes = [],
   dockerNetworks = [],
   now = Date.now(),
+  stackGraceMs = parseDurationMs(DEFAULT_STALE_RESOURCE_MAX_AGE, 30 * 60 * 1000),
 }) {
+  const targetsById = indexTargets(status);
   const activeRunnerNames = new Set(
-    (status.targets || [])
+    (status?.targets || [])
       .flatMap((target) => [
         ...(target.githubRunners || []).filter((runner) => runner.busy).map((runner) => runner.name),
         ...(target.activeJobs || []).map((job) => job.runner_name),
-        ...(target.localRunners || []).filter((runner) => runner.state === 'running').map((runner) => runner.runnerName),
+        ...(target.localRunners || [])
+          .filter((runner) => runner.state === 'running')
+          .map((runner) => runner.runnerName || runner.name),
       ])
       .filter(Boolean),
   );
 
-  const staleThresholdMs = parseDurationMs(DEFAULT_STALE_RESOURCE_MAX_AGE, 30 * 60 * 1000);
   const stacks = new Map();
-
-  function ensureStack(labels, fallbackId) {
-    const stackId = labels?.[MANAGED_STACK_LABEL] || labels?.[MANAGED_RUNNER_LABEL] || fallbackId;
-    const existing = stacks.get(stackId);
-    if (existing) {
-      return existing;
-    }
-
-    const stack = {
-      stackId,
-      targetId: labels?.[MANAGED_TARGET_LABEL] || '',
-      runnerName: labels?.[MANAGED_RUNNER_LABEL] || '',
-      createdMs: 0,
-      containerIds: [],
-      volumeNames: [],
-      networkNames: [],
-      runningContainerIds: [],
-    };
-    stacks.set(stackId, stack);
-    return stack;
-  }
+  const ignoredResources = [];
 
   for (const container of dockerContainers) {
-    const labels = container.Labels || {};
-    if (labels[MANAGED_LABEL] !== 'true') {
+    const labels = normalizeLabels(container.Labels);
+    if (!isManagedResource(labels)) {
       continue;
     }
 
-    const stack = ensureStack(labels, container.Id);
     const createdMs = parseCreatedMs(container.Created);
-    if (createdMs && (!stack.createdMs || createdMs < stack.createdMs)) {
-      stack.createdMs = createdMs;
-    }
-    stack.containerIds.push(container.Id);
+    const entry = mergeStackEntry(stacks, labels, container.Id, createdMs, 'container', container.Id);
     if (container.State === 'running') {
-      stack.runningContainerIds.push(container.Id);
+      entry.running = true;
+    }
+    if (!labels?.[MANAGED_TARGET_LABEL] || !labels?.[MANAGED_RUNNER_LABEL] || !labels?.[MANAGED_STACK_LABEL]) {
+      ignoredResources.push({
+        type: 'container',
+        id: container.Id,
+        reason: 'incomplete-labels',
+      });
     }
   }
 
   for (const volume of dockerVolumes) {
-    const labels = volume.Labels || {};
-    if (labels[MANAGED_LABEL] !== 'true') {
+    const labels = normalizeLabels(volume.Labels);
+    if (!isManagedResource(labels)) {
       continue;
     }
 
-    const stack = ensureStack(labels, volume.Name);
     const createdMs = parseCreatedMs(volume.CreatedAt);
-    if (createdMs && (!stack.createdMs || createdMs < stack.createdMs)) {
-      stack.createdMs = createdMs;
+    mergeStackEntry(stacks, labels, volume.Name, createdMs, 'volume', volume.Name);
+    if (!labels?.[MANAGED_TARGET_LABEL] || !labels?.[MANAGED_RUNNER_LABEL] || !labels?.[MANAGED_STACK_LABEL]) {
+      ignoredResources.push({
+        type: 'volume',
+        id: volume.Name,
+        reason: 'incomplete-labels',
+      });
     }
-    stack.volumeNames.push(volume.Name);
   }
 
   for (const network of dockerNetworks) {
-    const labels = network.Labels || {};
-    if (labels[MANAGED_LABEL] !== 'true') {
+    const labels = normalizeLabels(network.Labels);
+    if (!isManagedResource(labels)) {
       continue;
     }
 
-    const stack = ensureStack(labels, network.Name);
     const createdMs = parseCreatedMs(network.Created);
-    if (createdMs && (!stack.createdMs || createdMs < stack.createdMs)) {
-      stack.createdMs = createdMs;
+    mergeStackEntry(stacks, labels, network.Name, createdMs, 'network', network.Name);
+    if (!labels?.[MANAGED_TARGET_LABEL] || !labels?.[MANAGED_RUNNER_LABEL] || !labels?.[MANAGED_STACK_LABEL]) {
+      ignoredResources.push({
+        type: 'network',
+        id: network.Name,
+        reason: 'incomplete-labels',
+      });
     }
-    stack.networkNames.push(network.Name);
   }
 
   const staleManagedStacks = Array.from(stacks.values()).filter((stack) => {
-    if (!stack.createdMs || now - stack.createdMs < staleThresholdMs) {
+    if (!stack.stackId || !stack.createdMs) {
       return false;
     }
+    if (stack.running) {
+      return false;
+    }
+    if (now - stack.createdMs < stackGraceMs) {
+      return false;
+    }
+
+    const target: any = targetsById.get(stack.targetId);
+    const targetIsConfigured = Boolean(target);
+    const targetHasCapacity = Boolean(target?.runnersCount > 0);
+    const targetHasBusyWork = Boolean(
+      (target?.githubRunners || []).some((runner) => runner.busy)
+      || (target?.activeRuns || []).length > 0
+      || (target?.activeJobs || []).length > 0,
+    );
+    const targetNeedsProtection = targetIsConfigured && targetHasCapacity && !targetHasBusyWork;
+
+    if (targetNeedsProtection && now - stack.createdMs < stackGraceMs) {
+      return false;
+    }
+
     if (activeRunnerNames.has(stack.runnerName)) {
       return false;
     }
-    return stack.runningContainerIds.length === 0;
-  });
 
-  return { staleManagedStacks };
-}
-
-async function pruneDanglingResources(docker) {
-  const imageFilters = encodeURIComponent(JSON.stringify({ dangling: { true: true }, until: { [DEFAULT_DANGLING_MAX_AGE]: true } }));
-  const buildFilters = encodeURIComponent(JSON.stringify({ until: { [DEFAULT_BUILD_CACHE_MAX_AGE]: true } }));
-
-  const [images, volumes, buildCache] = await Promise.all([
-    docker(`/images/prune?filters=${imageFilters}`, { method: 'POST' }),
-    docker('/volumes/prune', { method: 'POST' }),
-    docker(`/build/prune?filters=${buildFilters}`, { method: 'POST' }),
-  ]);
+    return !targetHasBusyWork;
+  }).map((stack) => ({
+    stackId: stack.stackId,
+    targetId: stack.targetId,
+    runnerName: stack.runnerName,
+    createdMs: stack.createdMs,
+    ageMs: now - stack.createdMs,
+    targetConfigured: Boolean(targetsById.get(stack.targetId)),
+    containerIds: [...stack.containerIds],
+    volumeNames: [...stack.volumeNames],
+    networkNames: [...stack.networkNames],
+    labelCompleteness: stack.labelCompleteness,
+  }));
 
   return {
-    imagePrune: images.body,
-    volumePrune: volumes.body,
-    buildCachePrune: buildCache.body,
+    staleManagedStacks,
+    ignoredResources,
   };
 }
 
+async function executeFleetCleanupPlan({
+  plan,
+  removeStack,
+  reconcileTargets = [],
+  ensureRunnersForTarget,
+}) {
+  const removedStacks = [];
+  const errors = [];
+
+  for (const stack of plan?.staleManagedStacks || []) {
+    try {
+      await removeStack(stack.stackId, stack);
+      removedStacks.push(stack);
+    } catch (error) {
+      errors.push({ stackId: stack.stackId, error: error.message });
+    }
+  }
+
+  const reconciledTargets = [];
+  if (typeof ensureRunnersForTarget === 'function') {
+    for (const target of reconcileTargets) {
+      try {
+        const result = await ensureRunnersForTarget(target);
+        reconciledTargets.push({
+          targetId: target.id,
+          results: result,
+        });
+      } catch (error) {
+        errors.push({ targetId: target.id, error: error.message });
+      }
+    }
+  }
+
+  return {
+    removedStacks,
+    reconciledTargets,
+    errors,
+  };
+}
+
+function buildCleanupState() {
+  return {
+    running: false,
+    lastRunAt: null,
+    lastResult: null,
+    lastError: null,
+    lastStartedAt: null,
+  };
+}
+
+function snapshotCleanupState(state) {
+  return {
+    running: state.running,
+    lastRunAt: state.lastRunAt,
+    lastResult: state.lastResult,
+    lastError: state.lastError,
+    lastStartedAt: state.lastStartedAt,
+  };
+}
+
+function createCleanupRuntime() {
+  return {
+    maintenanceRunning: false,
+    fleet: buildCleanupState(),
+  };
+}
+
+function getCleanupStatus(runtime) {
+  return {
+    maintenanceRunning: runtime.maintenanceRunning,
+    fleet: snapshotCleanupState(runtime.fleet),
+  };
+}
+
+async function withCleanupLock(runtime, task) {
+  if (runtime.maintenanceRunning) {
+    return { skipped: true, reason: 'maintenance-running' };
+  }
+
+  runtime.maintenanceRunning = true;
+  try {
+    return await task();
+  } finally {
+    runtime.maintenanceRunning = false;
+  }
+}
+
 module.exports = {
-  buildCleanupPlan,
+  buildCleanupState,
+  buildCleanupPlan: buildFleetCleanupPlan,
+  buildFleetCleanupPlan,
+  createCleanupRuntime,
+  executeFleetCleanupPlan,
+  getCleanupStatus,
   parseDurationMs,
   shouldRunCleanup,
-  pruneDanglingResources,
+  snapshotCleanupState,
+  withCleanupLock,
 };

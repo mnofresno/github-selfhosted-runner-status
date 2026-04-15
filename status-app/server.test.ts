@@ -558,6 +558,9 @@ test('createServer serves target management and GitHub helper routes', async () 
     result = await requestJson(baseUrl, '/api/targets/fleet-a/launch', { method: 'POST' });
     assert.equal(result.response.status, 200);
 
+    result = await requestJson(baseUrl, '/api/targets/fleet-a/reconcile', { method: 'POST' });
+    assert.equal(result.response.status, 200);
+
     result = await requestJson(baseUrl, '/api/targets/fleet-a/runs/44/jobs');
     assert.equal(result.response.status, 200);
     assert.deepEqual(result.body, [{ id: 44, name: 'lint' }]);
@@ -614,6 +617,48 @@ test('createServer serves target management and GitHub helper routes', async () 
   } finally {
     clearStatusSnapshotCache();
     clearGithubStatusCache();
+    server.close();
+    await once(server, 'close');
+  }
+});
+
+test('createServer exposes cleanup admin routes and cleanup status snapshots', async () => {
+  clearStatusSnapshotCache();
+  const fleetCleanupResult = {
+    mode: 'fleet',
+    startedAt: '2026-04-15T12:00:00.000Z',
+    finishedAt: '2026-04-15T12:01:00.000Z',
+    durationMs: 60000,
+    plan: { staleManagedStacks: [], ignoredResources: [] },
+    removedStacks: [],
+    reconciledTargets: [],
+    errors: [],
+  };
+
+  const { server, baseUrl } = await startTestServer([], {
+    runFleetCleanupFn: async () => fleetCleanupResult,
+    getCleanupStatusFn: () => ({
+      maintenanceRunning: false,
+      fleet: {
+        running: false,
+        lastRunAt: fleetCleanupResult.finishedAt,
+        lastStartedAt: fleetCleanupResult.startedAt,
+        lastResult: fleetCleanupResult,
+        lastError: null,
+      },
+    }),
+  });
+
+  try {
+    let result = await requestJson(baseUrl, '/api/admin/cleanup/status');
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body.fleet.lastResult, fleetCleanupResult);
+
+    result = await requestJson(baseUrl, '/api/admin/cleanup/fleet', { method: 'POST' });
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body, fleetCleanupResult);
+  } finally {
+    clearStatusSnapshotCache();
     server.close();
     await once(server, 'close');
   }
