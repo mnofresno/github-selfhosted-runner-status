@@ -12,7 +12,7 @@ const {
   getCleanupStatus,
   shouldRunCleanup,
   withCleanupLock,
-} = require('./cleanup.ts');
+} = require('./cleanup');
 export {};
 
 type JsonResponse = { statusCode: number; body: any };
@@ -26,7 +26,6 @@ type CreateServerOptions = {
   ensureRunnersForTargetFn?: typeof ensureRunnersForTarget;
   forceCancelRunFn?: typeof forceCancelRun;
   getStatusFn?: typeof getStatus;
-  getCleanupStatusFn?: typeof snapshotCleanupStatus;
   githubOwnerSuggestionsFn?: typeof githubOwnerSuggestions;
   githubRepoSuggestionsFn?: typeof githubRepoSuggestions;
   listRunJobsFn?: typeof listRunJobs;
@@ -36,6 +35,7 @@ type CreateServerOptions = {
   saveTargetsFn?: typeof saveTargets;
   stopRunnersForTargetFn?: typeof stopRunnersForTarget;
   runFleetCleanupFn?: typeof runFleetCleanup;
+  getCleanupStatusFn?: typeof snapshotCleanupStatus;
 };
 
 const DEFAULT_PORT = 8080;
@@ -1174,7 +1174,7 @@ function renderClientShellFallback() {
 function createServer(initialTargets, options: CreateServerOptions = {}) {
   resetCleanupRuntime();
   const app = express();
-  let targets = [...initialTargets];
+  let targets = initialTargets;
   const {
     ensureRunnersForTargetFn = ensureRunnersForTarget,
     forceCancelRunFn = forceCancelRun,
@@ -1279,7 +1279,10 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
     }
 
     await stopRunnersForTargetFn(target.id, target.runnersCount);
-    targets = targets.filter((item) => item.id !== target.id);
+    const targetIndex = targets.findIndex((item) => item.id === target.id);
+    if (targetIndex >= 0) {
+      targets.splice(targetIndex, 1);
+    }
     saveTargetsFn(targets);
     clearStatusSnapshotCache();
     clearGithubStatusCache();
@@ -1322,6 +1325,23 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
     clearStatusSnapshotCache();
     clearGithubStatusCache();
     res.json(results);
+  }));
+
+  app.get('/api/admin/cleanup/status', asyncRoute(async (_req, res) => {
+    res.json(getCleanupStatusFn());
+  }));
+
+  app.post('/api/admin/cleanup/fleet', asyncRoute(async (_req, res) => {
+    try {
+      const result = await runFleetCleanupFn(targets, {
+        getStatusFn,
+        getCachedStatusFn: getCachedStatus,
+        ensureRunnersForTargetFn,
+      });
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
   }));
 
   app.get('/api/targets/:targetId/runs/:runId/jobs', asyncRoute(async (req, res) => {
@@ -1408,23 +1428,6 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
     res.json(sanitizeStatusForClient(await getCachedStatus(targets, getStatusFn)));
   }));
 
-  app.get('/api/admin/cleanup/status', asyncRoute(async (_req, res) => {
-    res.json(getCleanupStatusFn());
-  }));
-
-  app.post('/api/admin/cleanup/fleet', asyncRoute(async (_req, res) => {
-    try {
-      const result = await runFleetCleanupFn(targets, {
-        getStatusFn,
-        getCachedStatusFn: getCachedStatus,
-        ensureRunnersForTargetFn,
-      });
-      res.json(result);
-    } catch (error) {
-      res.status(500).json({ error: error.message });
-    }
-  }));
-
   app.use('/api', (_req, res) => {
     res.status(404).json({ error: 'Not found' });
   });
@@ -1504,10 +1507,9 @@ if (require.main === module) {
     })
     .catch((error) => console.error('[fleet] startup error:', error.message));
 
+  const server = createServer(targets);
   startHealthcheck(targets);
   startFleetCleanupLoop(targets);
-
-  const server = createServer(targets);
   server.listen(parseListenPort(process.env.STATUS_PORT), '0.0.0.0');
   console.log(`[fleet] dashboard listening on :${parseListenPort(process.env.STATUS_PORT)}`);
 }

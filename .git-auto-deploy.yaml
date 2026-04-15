@@ -1,4 +1,3 @@
 ---
 post_fetch_commands:
-  - docker compose up -d --remove-orphans
-  - docker compose restart runner-status
+  - docker compose up -d --build --remove-orphans

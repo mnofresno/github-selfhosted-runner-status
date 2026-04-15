@@ -239,7 +239,7 @@ function buildFleetCleanupPlan({
       return false;
     }
 
-    const target = targetsById.get(stack.targetId);
+    const target: any = targetsById.get(stack.targetId);
     const targetIsConfigured = Boolean(target);
     const targetHasCapacity = Boolean(target?.runnersCount > 0);
     const targetHasBusyWork = Boolean(
