@@ -1,17 +1,27 @@
 services:
   runner-status:
-    image: node:20-alpine
+    build:
+      context: .
+    image: github-runner-fleet:latest
     restart: unless-stopped
     env_file:
       - .env
     environment:
       STATUS_PORT: ${STATUS_INTERNAL_PORT:-8080}
-      RECONCILE_INTERVAL_MS: ${RECONCILE_INTERVAL_MS:-5000}
-      STACK_GRACE_MS: ${STACK_GRACE_MS:-30000}
-      MAX_RUNNERS_PER_TARGET: ${MAX_RUNNERS_PER_TARGET:-2}
-    command: ["node", "/app/server.js"]
+      HEALTHCHECK_INTERVAL_MS: ${HEALTHCHECK_INTERVAL_MS:-15000}
+      CLEANUP_ENABLED: ${CLEANUP_ENABLED:-true}
+      CLEANUP_INTERVAL_MS: ${CLEANUP_INTERVAL_MS:-3600000}
+      CLEANUP_COOLDOWN_MS: ${CLEANUP_COOLDOWN_MS:-900000}
+      CLEANUP_DANGLING_MAX_AGE: ${CLEANUP_DANGLING_MAX_AGE:-96h}
+      CLEANUP_BUILD_CACHE_MAX_AGE: ${CLEANUP_BUILD_CACHE_MAX_AGE:-96h}
+      STACK_GRACE_MS: ${STACK_GRACE_MS:-30m}
+      GLOBAL_PRUNE_EXCLUDE_LABELS: ${GLOBAL_PRUNE_EXCLUDE_LABELS:-io.github-runner-fleet.managed=true}
+      DATA_DIR: /app/data
     ports:
       - "${STATUS_BIND:-127.0.0.1:3571}:${STATUS_INTERNAL_PORT:-8080}"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./status-app:/app:ro
+      - runner-fleet-data:/app/data
+
+volumes:
+  runner-fleet-data:
